@@ -1,0 +1,2 @@
+﻿model,validation,mae,rmse,r2
+LightGBM,last_20_percent,12.619534415302534,23.369572899456827,-0.12972286727341067

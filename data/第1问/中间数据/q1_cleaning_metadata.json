@@ -1,5 +1,5 @@
 {
-  "source_file": "D:\\1_1jianmo\\赛题A\\附件1.原始数据.xlsx",
+  "source_file": "C:\\Users\\满心欢喜\\Desktop\\math\\附件1.原始数据.xlsx",
   "sheet_name": "co_levels_comparison_final（1）",
   "raw_rows_after_header": 2442,
   "clean_rows": 2442,
@@ -26,6 +26,7 @@
     "17#风箱负压",
     "18#风箱负压"
   ],
+  "speed_field": "烧结机机速L1设定",
   "merged_temperature_fields": [
     "1#风箱合并温度",
     "2#风箱合并温度",
