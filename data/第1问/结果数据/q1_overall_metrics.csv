@@ -1,2 +1,0 @@
-﻿模型组,模型组说明,候选模型,模型族,数据集,MAE_macro,RMSE_macro,R2_macro_mean,R2_macro_median,R2_negative_boxes,RMSE_over_std_macro,MAE_pooled,RMSE_pooled,R2_pooled
-M2_enhanced_online,负压历史+机速历史+过去温度,Ridge_alpha10,Ridge,final_test,5.95485865607747,10.116950362018171,0.6920722442305388,0.741175319003985,0,0.5283618805393996,5.954858656077471,13.189927713642717,0.9941173603300428
