@@ -1,0 +1,5 @@
+pressure-only feature leakage check
+feature_count: 587
+forbidden_keywords: 温度, CO, 大烟道, 南侧, 北侧
+bad_feature_count: 0
+status: PASS

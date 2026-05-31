@@ -1,0 +1,3 @@
+experiment,feature_group,mae,rmse,r2,note
+time_ordered_random_forest_base,pressure_only,12.378129,23.888966,-0.105624,按时间顺序前80%训练后20%测试的基础RandomForest
+hot_override_rel_lgbm_l1,pressure_only,11.790524,23.048042,-0.049996,相对负压+删除PSI>=1强漂移特征+后段目标轻度加权RF+12#-14#单输出LightGBM-L1覆盖
