@@ -2,61 +2,61 @@
 <rect width="100%" height="100%" fill="#ffffff"/>
 <style>text{font-family:Arial,Microsoft YaHei,sans-serif;font-size:13px;fill:#263238}.title{font-size:18px;font-weight:700}.small{font-size:11px;fill:#546E7A}.axis{stroke:#607D8B;stroke-width:1}.grid{stroke:#ECEFF1;stroke-width:1}.line1{fill:none;stroke:#1565C0;stroke-width:2}.line2{fill:none;stroke:#EF6C00;stroke-width:2}.line3{fill:none;stroke:#2E7D32;stroke-width:2}.bar{fill:#26A69A}.dot1{fill:#1565C0;opacity:.68}.dot2{fill:#EF6C00;opacity:.62}</style>
 <text x="300" y="32" class="title">Nonlinear process-variable permutation importance</text>
-<text x="300" y="52" class="small">基于非线性过程变量模型：置换某变量后 RMSE 增加越多，说明该变量越重要</text>
-<text x="18" y="80.6" class="small">7#风箱平均温度</text>
-<rect x="300" y="67.3" width="15.0" height="18.4" fill="#EF6C00" opacity="0.86"/>
-<text x="321.0" y="80.6" class="small">+0.09</text>
-<text x="18" y="110.2" class="small">1#风箱负压强度</text>
-<rect x="300" y="97.0" width="38.9" height="18.4" fill="#26A69A" opacity="0.86"/>
-<text x="344.9" y="110.2" class="small">+0.25</text>
-<text x="18" y="139.9" class="small">18#风箱平均温度</text>
-<rect x="300" y="126.7" width="44.7" height="18.4" fill="#EF6C00" opacity="0.86"/>
-<text x="350.7" y="139.9" class="small">+0.28</text>
+<text x="300" y="52" class="small">基于正式过程变量模型：置换某变量后 RMSE 增加越多，说明该变量越重要</text>
+<text x="18" y="80.6" class="small">2#风箱负压强度</text>
+<rect x="300" y="67.3" width="0.0" height="18.4" fill="#26A69A" opacity="0.86"/>
+<text x="306.0" y="80.6" class="small">+0.00</text>
+<text x="18" y="110.2" class="small">4#风箱平均温度</text>
+<rect x="300" y="97.0" width="2.5" height="18.4" fill="#EF6C00" opacity="0.86"/>
+<text x="308.5" y="110.2" class="small">+0.05</text>
+<text x="18" y="139.9" class="small">11#风箱平均温度</text>
+<rect x="300" y="126.7" width="6.5" height="18.4" fill="#EF6C00" opacity="0.86"/>
+<text x="312.5" y="139.9" class="small">+0.13</text>
 <text x="18" y="169.6" class="small">3#风箱平均温度</text>
-<rect x="300" y="156.3" width="54.5" height="18.4" fill="#EF6C00" opacity="0.86"/>
-<text x="360.5" y="169.6" class="small">+0.34</text>
-<text x="18" y="199.2" class="small">9#风箱平均温度</text>
-<rect x="300" y="186.0" width="70.2" height="18.4" fill="#EF6C00" opacity="0.86"/>
-<text x="376.2" y="199.2" class="small">+0.44</text>
-<text x="18" y="228.9" class="small">14#风箱平均温度</text>
-<rect x="300" y="215.7" width="114.9" height="18.4" fill="#EF6C00" opacity="0.86"/>
-<text x="420.9" y="228.9" class="small">+0.72</text>
-<text x="18" y="258.6" class="small">14#风箱负压强度</text>
-<rect x="300" y="245.3" width="117.3" height="18.4" fill="#26A69A" opacity="0.86"/>
-<text x="423.3" y="258.6" class="small">+0.74</text>
-<text x="18" y="288.2" class="small">17#风箱负压强度</text>
-<rect x="300" y="275.0" width="128.8" height="18.4" fill="#26A69A" opacity="0.86"/>
-<text x="434.8" y="288.2" class="small">+0.81</text>
-<text x="18" y="317.9" class="small">15#风箱负压强度</text>
-<rect x="300" y="304.7" width="129.1" height="18.4" fill="#26A69A" opacity="0.86"/>
-<text x="435.1" y="317.9" class="small">+0.81</text>
-<text x="18" y="347.6" class="small">8#风箱负压强度</text>
-<rect x="300" y="334.3" width="142.7" height="18.4" fill="#26A69A" opacity="0.86"/>
-<text x="448.7" y="347.6" class="small">+0.90</text>
-<text x="18" y="377.2" class="small">4#风箱平均温度</text>
-<rect x="300" y="364.0" width="151.6" height="18.4" fill="#EF6C00" opacity="0.86"/>
-<text x="457.6" y="377.2" class="small">+0.96</text>
-<text x="18" y="406.9" class="small">10#风箱负压强度</text>
-<rect x="300" y="393.7" width="164.8" height="18.4" fill="#26A69A" opacity="0.86"/>
-<text x="470.8" y="406.9" class="small">+1.04</text>
-<text x="18" y="436.6" class="small">1#大烟道负压强度</text>
-<rect x="300" y="423.3" width="171.3" height="18.4" fill="#1565C0" opacity="0.86"/>
-<text x="477.3" y="436.6" class="small">+1.08</text>
-<text x="18" y="466.2" class="small">16#风箱负压强度</text>
-<rect x="300" y="453.0" width="256.7" height="18.4" fill="#26A69A" opacity="0.86"/>
-<text x="562.7" y="466.2" class="small">+1.62</text>
+<rect x="300" y="156.3" width="11.1" height="18.4" fill="#EF6C00" opacity="0.86"/>
+<text x="317.1" y="169.6" class="small">+0.22</text>
+<text x="18" y="199.2" class="small">17#风箱平均温度</text>
+<rect x="300" y="186.0" width="19.0" height="18.4" fill="#EF6C00" opacity="0.86"/>
+<text x="325.0" y="199.2" class="small">+0.38</text>
+<text x="18" y="228.9" class="small">15#风箱平均温度</text>
+<rect x="300" y="215.7" width="19.3" height="18.4" fill="#EF6C00" opacity="0.86"/>
+<text x="325.3" y="228.9" class="small">+0.39</text>
+<text x="18" y="258.6" class="small">8#风箱负压强度</text>
+<rect x="300" y="245.3" width="20.6" height="18.4" fill="#26A69A" opacity="0.86"/>
+<text x="326.6" y="258.6" class="small">+0.42</text>
+<text x="18" y="288.2" class="small">1#风箱平均温度</text>
+<rect x="300" y="275.0" width="24.3" height="18.4" fill="#EF6C00" opacity="0.86"/>
+<text x="330.3" y="288.2" class="small">+0.49</text>
+<text x="18" y="317.9" class="small">10#风箱负压强度</text>
+<rect x="300" y="304.7" width="28.5" height="18.4" fill="#26A69A" opacity="0.86"/>
+<text x="334.5" y="317.9" class="small">+0.58</text>
+<text x="18" y="347.6" class="small">13#风箱平均温度</text>
+<rect x="300" y="334.3" width="36.2" height="18.4" fill="#EF6C00" opacity="0.86"/>
+<text x="342.2" y="347.6" class="small">+0.73</text>
+<text x="18" y="377.2" class="small">10#风箱平均温度</text>
+<rect x="300" y="364.0" width="38.4" height="18.4" fill="#EF6C00" opacity="0.86"/>
+<text x="344.4" y="377.2" class="small">+0.78</text>
+<text x="18" y="406.9" class="small">8#风箱平均温度</text>
+<rect x="300" y="393.7" width="48.6" height="18.4" fill="#EF6C00" opacity="0.86"/>
+<text x="354.6" y="406.9" class="small">+0.98</text>
+<text x="18" y="436.6" class="small">12#风箱负压强度</text>
+<rect x="300" y="423.3" width="64.0" height="18.4" fill="#26A69A" opacity="0.86"/>
+<text x="370.0" y="436.6" class="small">+1.30</text>
+<text x="18" y="466.2" class="small">14#风箱负压强度</text>
+<rect x="300" y="453.0" width="79.3" height="18.4" fill="#26A69A" opacity="0.86"/>
+<text x="385.3" y="466.2" class="small">+1.61</text>
 <text x="18" y="495.9" class="small">1#大烟道温度</text>
-<rect x="300" y="482.7" width="338.1" height="18.4" fill="#C62828" opacity="0.86"/>
-<text x="644.1" y="495.9" class="small">+2.13</text>
-<text x="18" y="525.6" class="small">11#风箱负压强度</text>
-<rect x="300" y="512.3" width="346.5" height="18.4" fill="#26A69A" opacity="0.86"/>
-<text x="652.5" y="525.6" class="small">+2.19</text>
-<text x="18" y="555.2" class="small">6#风箱平均温度</text>
-<rect x="300" y="542.0" width="512.3" height="18.4" fill="#EF6C00" opacity="0.86"/>
-<text x="818.3" y="555.2" class="small">+3.23</text>
-<text x="18" y="584.9" class="small">13#风箱平均温度</text>
+<rect x="300" y="482.7" width="100.1" height="18.4" fill="#C62828" opacity="0.86"/>
+<text x="406.1" y="495.9" class="small">+2.03</text>
+<text x="18" y="525.6" class="small">烧结机机速L1设定</text>
+<rect x="300" y="512.3" width="113.0" height="18.4" fill="#8E24AA" opacity="0.86"/>
+<text x="419.0" y="525.6" class="small">+2.29</text>
+<text x="18" y="555.2" class="small">6#风箱负压强度</text>
+<rect x="300" y="542.0" width="138.8" height="18.4" fill="#26A69A" opacity="0.86"/>
+<text x="444.8" y="555.2" class="small">+2.81</text>
+<text x="18" y="584.9" class="small">9#风箱平均温度</text>
 <rect x="300" y="571.7" width="590.0" height="18.4" fill="#EF6C00" opacity="0.86"/>
-<text x="896.0" y="584.9" class="small">+3.72</text>
+<text x="896.0" y="584.9" class="small">+11.95</text>
 <line x1="300" y1="62" x2="300" y2="596" class="axis"/>
 <text x="770" y="632" class="small">RMSE increase</text>
 </svg>

@@ -5,19 +5,19 @@
 <text x="210" y="52" class="small">将整组变量替换为训练集均值；RMSE 增加为正表示该组对过程变量模型贡献更大</text>
 <line x1="480.0" y1="62" x2="480.0" y2="366" stroke="#455A64" stroke-width="1.2"/>
 <text x="18" y="99.9" class="small">风箱平均温度</text>
-<rect x="418.5" y="75.4" width="61.5" height="34.0" fill="#1565C0" opacity="0.84"/>
-<text x="360.5" y="99.9" class="small">-9.6</text>
-<text x="18" y="160.7" class="small">风箱负压强度</text>
-<rect x="447.8" y="136.2" width="32.2" height="34.0" fill="#1565C0" opacity="0.84"/>
-<text x="389.8" y="160.7" class="small">-5.0</text>
+<rect x="210.0" y="75.4" width="270.0" height="34.0" fill="#1565C0" opacity="0.84"/>
+<text x="152.0" y="99.9" class="small">-64.0</text>
+<text x="18" y="160.7" class="small">大烟道负压强度</text>
+<rect x="440.0" y="136.2" width="40.0" height="34.0" fill="#1565C0" opacity="0.84"/>
+<text x="382.0" y="160.7" class="small">-9.5</text>
 <text x="18" y="221.5" class="small">机速</text>
-<rect x="465.3" y="197.0" width="14.7" height="34.0" fill="#1565C0" opacity="0.84"/>
-<text x="407.3" y="221.5" class="small">-2.3</text>
+<rect x="445.3" y="197.0" width="34.7" height="34.0" fill="#1565C0" opacity="0.84"/>
+<text x="387.3" y="221.5" class="small">-8.2</text>
 <text x="18" y="282.3" class="small">大烟道温度</text>
-<rect x="480.0" y="257.8" width="122.0" height="34.0" fill="#C62828" opacity="0.84"/>
-<text x="608.0" y="282.3" class="small">+19.1</text>
-<text x="18" y="343.1" class="small">大烟道负压强度</text>
-<rect x="480.0" y="318.6" width="270.0" height="34.0" fill="#C62828" opacity="0.84"/>
-<text x="756.0" y="343.1" class="small">+42.3</text>
+<rect x="468.6" y="257.8" width="11.4" height="34.0" fill="#1565C0" opacity="0.84"/>
+<text x="410.6" y="282.3" class="small">-2.7</text>
+<text x="18" y="343.1" class="small">风箱负压强度</text>
+<rect x="470.9" y="318.6" width="9.1" height="34.0" fill="#1565C0" opacity="0.84"/>
+<text x="412.9" y="343.1" class="small">-2.2</text>
 <text x="210" y="402" class="small">蓝色：消融后 RMSE 降低或无贡献；红色：消融后 RMSE 增加</text>
 </svg>

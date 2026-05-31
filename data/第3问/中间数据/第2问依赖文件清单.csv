@@ -1,0 +1,12 @@
+﻿依赖文件,路径
+第1问报告,D:\1_1jianmo\math\result\第1问\第1问.md
+第1问字段说明,D:\1_1jianmo\math\result\第1问\风箱温度字段说明.md
+第1问模型schema,D:\1_1jianmo\math\data\第1问\结果数据\q1_model_schema.json
+第1问模型特征,D:\1_1jianmo\math\data\第1问\中间数据\q1_model_features.csv
+第1问模型目标,D:\1_1jianmo\math\data\第1问\中间数据\q1_model_targets.csv
+第2问监测型模型,D:\1_1jianmo\math\result\第2问\修正异常值数据建模\CO预测模型_监测型模型.json
+第2问模型接口说明,D:\1_1jianmo\math\result\第2问\CO预测模型接口说明.md
+第2问输入输出字段清单,D:\1_1jianmo\math\result\第2问\输入输出字段清单.md
+第2问数据配准说明,D:\1_1jianmo\math\result\第2问\数据配准说明.md
+第2问滞后配准建模数据,D:\1_1jianmo\math\data\第2问\中间数据\滞后配准建模数据.csv
+第2问最佳滞后配准,D:\1_1jianmo\math\data\第2问\中间数据\最佳滞后配准.csv
