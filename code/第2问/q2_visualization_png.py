@@ -219,11 +219,16 @@ def plot_lag_alignment() -> None:
     ax.set_title("A  数据配准带来的预测收益")
 
     ax = axes[1]
-    for label, color, marker in [("负压强度", COLORS["blue"], "o"), ("平均温度", COLORS["red"], "s")]:
+    for label, color, marker, offset, linestyle in [
+        ("负压强度", COLORS["blue"], "o", -0.07, "-"),
+        ("平均温度", COLORS["red"], "s", 0.07, "--"),
+    ]:
         sub = wind[wind["变量类别"] == label].sort_values("风箱编号")
-        ax.plot(sub["风箱编号"], sub["最佳滞后秒数"], marker=marker, lw=2, color=color, label=label)
+        x = sub["风箱编号"].astype(float) + offset
+        ax.plot(x, sub["最佳滞后秒数"], marker=marker, ls=linestyle, lw=2, color=color, label=label)
     ax.axhline(300, color=COLORS["gray"], ls="--", lw=1, label="300s 截断窗口")
     ax.set_xticks(range(1, 19))
+    ax.set_xlim(0.5, 18.5)
     ax.set_xlabel("风箱编号")
     ax.set_ylabel("最佳滞后 (s)")
     ax.set_title("B  各风箱变量的空间时滞")
@@ -374,14 +379,36 @@ def plot_ablation_and_nonlinear() -> None:
 
     ax = axes[1]
     nonlinear = nonlinear.copy()
-    nonlinear = nonlinear[(nonlinear["数据集"] == "测试集") & (nonlinear["模型"] != "基线3_过程变量+历史CO监测型模型")]
+    nonlinear = nonlinear[nonlinear["数据集"] == "测试集"].copy()
     nonlinear["短名"] = nonlinear["模型"].map(short_model_name)
-    ax.bar(nonlinear["短名"], nonlinear["RMSE"], color=COLORS["purple"], alpha=0.84)
-    ax.axhline(149.828, color=COLORS["orange"], ls="--", lw=1.2, label="推荐监测模型")
+    nonlinear["是否推荐"] = nonlinear["模型"] == "基线3_过程变量+历史CO监测型模型"
+    nonlinear = nonlinear.sort_values("RMSE")
+    recommended_rmse = float(nonlinear.loc[nonlinear["是否推荐"], "RMSE"].iloc[0])
+    best_other_rmse = float(nonlinear.loc[~nonlinear["是否推荐"], "RMSE"].min())
+    advantage = (best_other_rmse - recommended_rmse) / best_other_rmse * 100
+    bar_colors = np.where(nonlinear["是否推荐"], COLORS["orange"], COLORS["purple"])
+    bars = ax.bar(nonlinear["短名"], nonlinear["RMSE"], color=bar_colors, alpha=0.9)
+    ax.axhline(recommended_rmse, color=COLORS["orange"], ls="--", lw=1.0, alpha=0.75)
+    for bar, value, is_recommended in zip(bars, nonlinear["RMSE"], nonlinear["是否推荐"]):
+        label = f"{value:.1f}"
+        if not is_recommended:
+            label += f"\n+{(value - recommended_rmse) / recommended_rmse * 100:.0f}%"
+        ax.text(bar.get_x() + bar.get_width() / 2, value + 5, label, ha="center", va="bottom", fontsize=8)
+    ax.text(
+        0.02,
+        0.93,
+        f"推荐模型 RMSE 最低\n较最佳非线性模型低 {advantage:.1f}%",
+        transform=ax.transAxes,
+        ha="left",
+        va="top",
+        fontsize=9,
+        color=COLORS["orange"],
+        fontweight="bold",
+    )
     ax.set_ylabel("测试 RMSE")
-    ax.set_title("B  非线性监测模型未超过推荐模型")
-    ax.tick_params(axis="x", rotation=25)
-    ax.legend(frameon=False)
+    ax.set_ylim(0, nonlinear["RMSE"].max() * 1.22)
+    ax.set_title("B  推荐监测模型显著优于非线性模型")
+    ax.tick_params(axis="x", rotation=22)
     save(fig, "可选_08_消融贡献与非线性模型对比.png")
 
 

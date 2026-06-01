@@ -9,6 +9,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from matplotlib.colors import TwoSlopeNorm
+from scipy.interpolate import RectBivariateSpline
 from scipy.ndimage import gaussian_filter
 from scipy.signal import find_peaks
 
@@ -325,9 +326,17 @@ def plot_local_3d_state_surface() -> None:
     pressure = ((window[pressure_cols] - train[pressure_cols].mean()) / train[pressure_cols].std()).to_numpy()
     temp = np.clip(temp, -3.0, 3.0)
     pressure = np.clip(pressure, -3.0, 3.0)
-    temp = gaussian_filter(temp, sigma=(2.0, 0.8))
-    pressure = gaussian_filter(pressure, sigma=(2.0, 0.8))
-    X, Y = np.meshgrid(rel, boxes, indexing="ij")
+
+    def smoothed_surface(data: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        base = gaussian_filter(data, sigma=(3.0, 1.25), mode="nearest")
+        rel_dense = np.linspace(rel.min(), rel.max(), 260)
+        boxes_dense = np.linspace(boxes.min(), boxes.max(), 110)
+        spline = RectBivariateSpline(rel, boxes, base, kx=3, ky=3, s=0)
+        dense = spline(rel_dense, boxes_dense)
+        dense = gaussian_filter(dense, sigma=(0.8, 0.7), mode="nearest")
+        dense = np.clip(dense, -2.6, 2.6)
+        x_dense, y_dense = np.meshgrid(rel_dense, boxes_dense, indexing="ij")
+        return x_dense, y_dense, dense
 
     fig = plt.figure(figsize=(12.8, 6.4), constrained_layout=True)
     for idx, (data, title, cmap) in enumerate(
@@ -336,7 +345,19 @@ def plot_local_3d_state_surface() -> None:
     ):
         ax = fig.add_subplot(1, 2, idx, projection="3d")
         norm = TwoSlopeNorm(vcenter=0, vmin=-2.4, vmax=2.4)
-        surf = ax.plot_surface(X, Y, data, cmap=cmap, norm=norm, linewidth=0, antialiased=True, rcount=90, ccount=18)
+        X, Y, smooth_data = smoothed_surface(data)
+        surf = ax.plot_surface(
+            X,
+            Y,
+            smooth_data,
+            cmap=cmap,
+            norm=norm,
+            linewidth=0,
+            antialiased=False,
+            shade=False,
+            rstride=1,
+            cstride=1,
+        )
         ax.set_title(title)
         ax.set_xlabel("相对峰值时间 (s)")
         ax.set_ylabel("风箱编号")

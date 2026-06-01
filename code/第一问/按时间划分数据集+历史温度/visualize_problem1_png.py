@@ -67,7 +67,7 @@ FIGURE_NOTES = [
     ("必备_04_模型性能对比.png", "支撑最终模型选择，并保留 pressure-only 对照。"),
     ("必备_05_预测跟踪与一致性.png", "展示最优模型实际值、预测值的一致性。"),
     ("必备_06_逐风箱误差与残差诊断.png", "定位不同风箱的预测难度和残差时间段。"),
-    ("可选_07_特征重要性结构.png", "用 SHAP summary 图解释历史温度、负压与空间派生特征的贡献方向和强度。"),
+    ("可选_07_特征重要性结构.png", "用 SHAP 摘要图解释历史温度、负压与空间派生特征的贡献方向和强度。"),
     ("可选_08_历史温度与负压消融贡献.png", "量化加入负压后的边际改进。"),
     ("可选_09_3D温度时空平滑曲面.png", "平滑展示目标温度的时空形态。"),
     ("可选_10_3D负压时空平滑曲面.png", "平滑展示负压输入的时空形态。"),
@@ -464,6 +464,127 @@ SEGMENT_BOXES = {
     "all": BOX_IDS,
 }
 
+SEGMENT_LABELS = {
+    "front": "前段",
+    "middle": "中段",
+    "back": "后段",
+    "long": "长区",
+    "short": "短区",
+    "all": "全局",
+}
+
+STAT_LABELS = {
+    "mean": "均值",
+    "std": "标准差",
+    "min": "最小值",
+    "max": "最大值",
+    "range": "极差",
+    "abs_mean": "绝对值均值",
+    "abs_length_weighted_mean": "绝对值长度加权均值",
+}
+
+
+def translate_feature_name(feature: str) -> str:
+    name = str(feature)
+    lower = name.lower()
+
+    if lower == "speed":
+        return "机速"
+
+    temp_delta = re.match(r"^box_(\d{2})_avg_temp_hist_delta_(\d+)_(\d+)$", lower)
+    if temp_delta:
+        box_id, start, end = temp_delta.groups()
+        return f"{int(box_id)}#温度{start}-{end}步差"
+
+    temp_lag = re.match(r"^box_(\d{2})_avg_temp_lag_(\d+)$", lower)
+    if temp_lag:
+        box_id, lag = temp_lag.groups()
+        return f"{int(box_id)}#温度滞后{lag}步"
+
+    segment_temp = re.match(r"^(front|middle|back)_temp_(mean|range)_lag_(\d+)$", lower)
+    if segment_temp:
+        segment, stat, lag = segment_temp.groups()
+        stat_label = "均值" if stat == "mean" else "极差"
+        return f"{SEGMENT_LABELS[segment]}温度{stat_label}滞后{lag}步"
+
+    adjacent = re.match(r"^p_adjacent_(diff|absdiff)_(\d{2})_(\d{2})$", lower)
+    if adjacent:
+        kind, left, right = adjacent.groups()
+        label = "负压差" if kind == "diff" else "负压绝对差"
+        return f"{int(left)}-{int(right)}#相邻{label}"
+
+    pressure_box = re.match(r"^p_(\d{2})(?:_(.*))?$", lower)
+    if pressure_box:
+        box_id, suffix = pressure_box.groups()
+        suffix = suffix or ""
+        prefix = f"{int(box_id)}#"
+        if suffix == "":
+            return f"{prefix}风箱负压"
+        if suffix == "abs_suction":
+            return f"{prefix}负压绝对吸力"
+        if suffix == "abs_suction_share":
+            return f"{prefix}负压吸力占比"
+        if suffix == "neighbor_mean":
+            return f"{prefix}相邻负压均值"
+        if suffix == "local_mean":
+            return f"{prefix}局部负压均值"
+        if suffix == "local_range":
+            return f"{prefix}局部负压极差"
+        if suffix == "minus_neighbor_mean":
+            return f"{prefix}负压-相邻均值"
+        if suffix == "minus_all_mean":
+            return f"{prefix}负压-全局均值"
+        lag = re.match(r"^lag_(\d+)$", suffix)
+        if lag:
+            return f"{prefix}负压滞后{lag.group(1)}步"
+        delta = re.match(r"^delta_(\d+)$", suffix)
+        if delta:
+            return f"{prefix}负压{delta.group(1)}步变化量"
+        rate = re.match(r"^rate_(\d+)$", suffix)
+        if rate:
+            return f"{prefix}负压{rate.group(1)}步变化率"
+        roll = re.match(r"^roll(\d+)_(mean|std|range)$", suffix)
+        if roll:
+            window, stat = roll.groups()
+            return f"{prefix}负压{window}步滚动{STAT_LABELS[stat]}"
+
+    segment_pressure = re.match(r"^(front|middle|back|long|short)_p_(.+)$", lower)
+    if segment_pressure:
+        segment, stat = segment_pressure.groups()
+        return f"{SEGMENT_LABELS[segment]}负压{STAT_LABELS.get(stat, stat)}"
+
+    segment_gap = re.match(r"^(front|middle|back|long|short)_minus_(front|middle|back|long|short)_p_mean$", lower)
+    if segment_gap:
+        left, right = segment_gap.groups()
+        return f"{SEGMENT_LABELS[left]}-{SEGMENT_LABELS[right]}负压均值"
+
+    global_pressure = {
+        "p_all_mean": "全局负压均值",
+        "p_all_std": "全局负压标准差",
+        "p_all_min": "全局负压最小值",
+        "p_all_max": "全局负压最大值",
+        "p_all_range": "全局负压极差",
+        "p_abs_all_mean": "全局负压绝对值均值",
+        "p_abs_length_weighted_mean": "负压绝对值长度加权均值",
+        "p_abs_position_weighted_mean": "负压绝对值位置加权均值",
+        "p_abs_center_of_suction": "负压吸力中心",
+    }
+    if lower in global_pressure:
+        return global_pressure[lower]
+
+    speed_dynamic = re.match(r"^speed_(lag|delta|rate)_(\d+)$", lower)
+    if speed_dynamic:
+        kind, step = speed_dynamic.groups()
+        labels = {"lag": "滞后", "delta": "变化量", "rate": "变化率"}
+        return f"机速{step}步{labels[kind]}"
+
+    speed_roll = re.match(r"^speed_roll(\d+)_(mean|std)$", lower)
+    if speed_roll:
+        window, stat = speed_roll.groups()
+        return f"机速{window}步滚动{STAT_LABELS[stat]}"
+
+    return name
+
 
 def feature_boxes(feature: str) -> list[int] | None:
     lower = str(feature).lower()
@@ -583,11 +704,11 @@ def _plot_feature_importance_bubble() -> Path:
     )
     for y, value in zip(y_pos, top_plot["重要性占比"]):
         ax_top.text(value + 0.08, y, f"{value:.2f}%", va="center", fontsize=8.5, color="#26323f")
-    ax_top.set_title("B  Top 18 单项特征气泡排序", loc="left", fontsize=15, pad=12)
+    ax_top.set_title("B  前18项单项特征气泡排序", loc="left", fontsize=15, pad=12)
     ax_top.set_xlabel("单项重要性占比 / %")
     ax_top.set_ylabel("")
     ax_top.set_yticks(y_pos)
-    ax_top.set_yticklabels(top_plot["feature"], fontsize=9)
+    ax_top.set_yticklabels(top_plot["feature"].map(translate_feature_name), fontsize=9)
     ax_top.set_xlim(0, float(top["重要性占比"].max()) * 1.25)
     ax_top.grid(True, axis="x", color="#d9e1e8", linewidth=0.85, alpha=0.75)
     ax_top.grid(False, axis="y")
@@ -704,7 +825,7 @@ def compute_multioutput_shap(model, x_sample: pd.DataFrame) -> tuple[np.ndarray,
 
     estimators = getattr(model.model, "estimators_", None)
     if not estimators:
-        raise ValueError("SHAP summary 需要已拟合的多输出树模型。")
+        raise ValueError("特征贡献摘要图需要已拟合的多输出树模型。")
 
     shap_values = []
     data_values = x_sample.to_numpy(dtype=float)
@@ -737,20 +858,26 @@ def plot_feature_importance() -> Path:
 
     x_sample = sample_for_shap(x_history[required_cols])
     shap_values, feature_values, feature_names = compute_multioutput_shap(narx_model, x_sample)
+    display_feature_names = [translate_feature_name(name) for name in feature_names]
 
     shap.summary_plot(
         shap_values,
         feature_values,
-        feature_names=feature_names,
+        feature_names=display_feature_names,
         max_display=SHAP_MAX_DISPLAY,
         show=False,
         plot_size=(14.5, 9.0),
         color_bar_label="特征取值",
     )
     fig = plt.gcf()
-    fig.suptitle("SHAP summary：最终 ΔT-LightGBM 模型特征贡献", fontsize=15, fontweight="bold", y=1.02)
+    for axis in fig.axes:
+        labels = [label.get_text() for label in axis.get_yticklabels()]
+        if any(label in {"High", "Low"} for label in labels):
+            axis.set_yticks(axis.get_yticks())
+            axis.set_yticklabels([{"High": "高", "Low": "低"}.get(label, label) for label in labels])
+    fig.suptitle("SHAP摘要：最终温度增量 LightGBM 模型特征贡献", fontsize=15, fontweight="bold", y=1.02)
     ax = plt.gca()
-    ax.set_xlabel("SHAP值（对温度增量预测的贡献 / ℃）")
+    ax.set_xlabel("贡献值（对温度增量预测的影响 / ℃）")
     ax.set_ylabel("")
     fig.text(
         0.01,
