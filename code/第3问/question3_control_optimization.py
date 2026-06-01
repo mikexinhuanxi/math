@@ -63,9 +63,21 @@ EMISSION_STANDARD = 2800.0
 NEAR_STANDARD = 3200.0
 Q10_ALPHA = 0.10
 Q05_ALPHA = 0.05
+Q50_ALPHA = 0.50
+Q90_ALPHA = 0.90
+ROBUST_STANDARD_MARGIN = 100.0
+ROBUST_STANDARD = EMISSION_STANDARD - ROBUST_STANDARD_MARGIN
+Q10_CONSTRAINT_STANDARD = ROBUST_STANDARD
+Q50_DESIRED_STANDARD = EMISSION_STANDARD
+STRICT_PROB_MEDIAN_TARGET = 0.50
+STRICT_PROB_SOFT_MIN = 0.35
+PLANNING_PROBABILITY_THRESHOLD = STRICT_PROB_SOFT_MIN
+NEAR_PROB_SOFT_MIN = 0.80
+LOW_LAYER_ALPHA_FLOOR = 0.20
+LOW_LAYER_ALPHA_CEIL = 0.80
 TAIL_NEIGHBOR_CO = 3600.0
 THEORY_TEMP_DELTA_LIMIT = 90.0
-ENGINEERING_TEMP_DELTA_LIMIT = 35.0
+ENGINEERING_TEMP_DELTA_LIMIT = 60.0
 RANGE_LOW_Q = 0.10
 RANGE_HIGH_Q = 0.90
 MAIN_RANGE_LOW_Q = 0.05
@@ -76,21 +88,32 @@ SINGLE_ADJUST_FRACTION = 0.35
 SINGLE_ADJUST_MIN = 0.10
 SINGLE_ADJUST_MAX = 1.20
 TOTAL_BUDGET_FRACTION = 0.45
+SCHEME_B_MIN_ADJUST = 0.50
 Q2_CORRECTED_CO_COL = "第二问异常修正后CO"
 Q2_CO_REPAIRED_FLAG_COL = "第二问CO是否修正"
 Q2_CO_SPIKE_FLAG_COL = "第二问CO局部尖峰异常"
 Q2_CO_GLOBAL_FLAG_COL = "第二问CO全局界限异常"
 ISOLATED_LOW_FLAG_COL = "CO孤立低谷异常"
 TRUSTED_STANDARD_COL = "可信达标样本"
+STRICT_TRUSTED_STANDARD_COL = "严格可信达标样本_原异常剔除口径"
+SINGLE_POINT_PASS_COL = "single_point_pass"
+WINDOW_MEDIAN_PASS_COL = "window_median_pass"
+WINDOW_MEDIAN_CO_COL = "未来窗口CO中位数"
 LOW_EMISSION_SEGMENT_COL = "低排放片段ID"
 LOW_EMISSION_MIN_DURATION_S = 30
 LOW_EMISSION_QUANTILE = 0.15
 STABILITY_WINDOW_S = 30
 REGIME_COUNT = 3
 CONTROL_EFFECT_HORIZON_S = 300
+FUTURE_TARGET_WINDOW_S = 300
 ROLLING_CONTROL_WINDOW_S = 300
+EVAL_SAMPLE_MAX = 80
+ROLLING_MAX_STEPS = 60
+MAIN_POWELL_MAX_STARTS = 4
+MAIN_POWELL_MAXITER = 3
 LOW_POTENTIAL_BASELINE_CO = 3200.0
 LOW_POTENTIAL_MAX = 900.0
+_TEMP_BOUNDS_CACHE: dict[tuple[int, float, float], tuple[np.ndarray, np.ndarray]] = {}
 
 
 def ensure_dirs() -> None:
@@ -210,7 +233,7 @@ def trusted_standard_mask(df: pd.DataFrame) -> pd.Series:
 
 
 def apply_q2_corrected_co(cleaned: pd.DataFrame) -> pd.DataFrame:
-    """Use Q2 abnormal-corrected CO as Q3 target and tag reliable standard samples."""
+    """Keep Q2 abnormal diagnostics, but use the measured CO values for Q3 optimization."""
     df = cleaned.copy()
     df["第三问原始CO"] = pd.to_numeric(df[TARGET_COL], errors="coerce")
 
@@ -244,52 +267,87 @@ def apply_q2_corrected_co(cleaned: pd.DataFrame) -> pd.DataFrame:
         df[Q2_CO_GLOBAL_FLAG_COL] = False
 
     df[Q2_CORRECTED_CO_COL] = pd.to_numeric(df[Q2_CORRECTED_CO_COL], errors="coerce").fillna(df["第三问原始CO"])
-    df[TARGET_COL] = df[Q2_CORRECTED_CO_COL]
+    df[TARGET_COL] = df["第三问原始CO"]
 
     for col in [Q2_CO_REPAIRED_FLAG_COL, Q2_CO_SPIKE_FLAG_COL, Q2_CO_GLOBAL_FLAG_COL]:
         if col not in df.columns:
             df[col] = False
         df[col] = bool_series(df[col])
 
-    standard = df[TARGET_COL] <= EMISSION_STANDARD
-    run_id = standard.ne(standard.shift(fill_value=False)).cumsum()
-    standard_run_len = standard.groupby(run_id).transform("sum")
-    isolated_low = standard & (standard_run_len <= 1)
-    abnormal = df[Q2_CO_REPAIRED_FLAG_COL] | df[Q2_CO_SPIKE_FLAG_COL] | df[Q2_CO_GLOBAL_FLAG_COL] | isolated_low
+    single_point_pass = df[TARGET_COL] <= EMISSION_STANDARD
+    corrected_pass = df[Q2_CORRECTED_CO_COL] <= EMISSION_STANDARD
+    run_id = corrected_pass.ne(corrected_pass.shift(fill_value=False)).cumsum()
+    standard_run_len = corrected_pass.groupby(run_id).transform("sum")
+    isolated_low = corrected_pass & (standard_run_len <= 1)
+    strict_abnormal = df[Q2_CO_REPAIRED_FLAG_COL] | df[Q2_CO_SPIKE_FLAG_COL] | df[Q2_CO_GLOBAL_FLAG_COL] | isolated_low
 
-    df["CO达标样本_修正后小于等于2800"] = standard
+    df["CO达标样本_修正后小于等于2800"] = corrected_pass
+    df["CO达标样本_原始小于等于2800"] = single_point_pass
     df[ISOLATED_LOW_FLAG_COL] = isolated_low
-    df["CO达标异常剔除标记"] = abnormal
-    df[TRUSTED_STANDARD_COL] = standard & ~abnormal
+    df["CO达标异常剔除标记"] = strict_abnormal
+    df[STRICT_TRUSTED_STANDARD_COL] = corrected_pass & ~strict_abnormal
+    df[TRUSTED_STANDARD_COL] = single_point_pass
 
     summary = pd.DataFrame(
         [
             {
                 "样本数": int(len(df)),
-                "修正后CO小于等于2800样本数": int(standard.sum()),
+                "原始CO小于等于2800样本数_不剔除": int(single_point_pass.sum()),
+                "修正后CO小于等于2800样本数": int(corrected_pass.sum()),
                 "第二问已修正CO点数": int(df[Q2_CO_REPAIRED_FLAG_COL].sum()),
                 "第二问局部尖峰异常点数": int(df[Q2_CO_SPIKE_FLAG_COL].sum()),
                 "第二问全局界限异常点数": int(df[Q2_CO_GLOBAL_FLAG_COL].sum()),
                 "孤立低谷达标点数": int(isolated_low.sum()),
                 "可信达标样本数": int(df[TRUSTED_STANDARD_COL].sum()),
                 "可信达标比例_%": float(df[TRUSTED_STANDARD_COL].mean() * 100),
-                "CO口径": "第三问目标列已替换为第二问异常修正后的CO；达标=修正后CO<=2800且非修正异常点、非孤立低谷。",
+                "严格可信达标样本数_原异常剔除口径": int(df[STRICT_TRUSTED_STANDARD_COL].sum()),
+                "严格可信达标比例_%": float(df[STRICT_TRUSTED_STANDARD_COL].mean() * 100),
+                "CO口径": "第三问目标列使用原始实测CO，低CO浓度不剔除；第二问修正CO和异常标记仅作为诊断，同时保留严格可信达标口径用于对照。",
             }
         ]
     )
     save_csv(summary, DATA_OUT / "第二问修正CO可信达标样本摘要.csv")
-    save_csv(df[["序列", "时间_s", "第三问原始CO", Q2_CORRECTED_CO_COL, "修正差值", Q2_CO_REPAIRED_FLAG_COL, Q2_CO_SPIKE_FLAG_COL, Q2_CO_GLOBAL_FLAG_COL, ISOLATED_LOW_FLAG_COL, TRUSTED_STANDARD_COL]], DATA_OUT / "第二问修正CO可信达标样本明细.csv")
+    save_csv(
+        df[
+            [
+                "序列",
+                "时间_s",
+                "第三问原始CO",
+                Q2_CORRECTED_CO_COL,
+                "修正差值",
+                Q2_CO_REPAIRED_FLAG_COL,
+                Q2_CO_SPIKE_FLAG_COL,
+                Q2_CO_GLOBAL_FLAG_COL,
+                ISOLATED_LOW_FLAG_COL,
+                "CO达标样本_原始小于等于2800",
+                "CO达标样本_修正后小于等于2800",
+                STRICT_TRUSTED_STANDARD_COL,
+                TRUSTED_STANDARD_COL,
+            ]
+        ],
+        DATA_OUT / "第二问修正CO可信达标样本明细.csv",
+    )
     save_csv(df, DATA_MID / "清洗后数据.csv")
     save_csv(df, DATA_MID / "清洗后数据_第二问CO异常修正口径.csv")
     return df
 
 
 def apply_q2_corrected_co_to_aligned(aligned: pd.DataFrame, cleaned: pd.DataFrame) -> pd.DataFrame:
-    cols = ["序列", Q2_CORRECTED_CO_COL, Q2_CO_REPAIRED_FLAG_COL, Q2_CO_SPIKE_FLAG_COL, Q2_CO_GLOBAL_FLAG_COL, ISOLATED_LOW_FLAG_COL, TRUSTED_STANDARD_COL]
+    cols = [
+        "序列",
+        TARGET_COL,
+        Q2_CORRECTED_CO_COL,
+        Q2_CO_REPAIRED_FLAG_COL,
+        Q2_CO_SPIKE_FLAG_COL,
+        Q2_CO_GLOBAL_FLAG_COL,
+        ISOLATED_LOW_FLAG_COL,
+        STRICT_TRUSTED_STANDARD_COL,
+        TRUSTED_STANDARD_COL,
+    ]
     addon = cleaned[[c for c in cols if c in cleaned.columns]].copy()
     out = aligned.drop(columns=[c for c in cols if c in aligned.columns and c != "序列"], errors="ignore").merge(addon, on="序列", how="left")
     out[Q2_CORRECTED_CO_COL] = pd.to_numeric(out[Q2_CORRECTED_CO_COL], errors="coerce").fillna(pd.to_numeric(out[TARGET_COL], errors="coerce"))
-    out[TARGET_COL] = out[Q2_CORRECTED_CO_COL]
+    out[TARGET_COL] = pd.to_numeric(out[TARGET_COL], errors="coerce").fillna(out[Q2_CORRECTED_CO_COL])
     if TRUSTED_STANDARD_COL not in out.columns:
         out[TRUSTED_STANDARD_COL] = out[TARGET_COL] <= EMISSION_STANDARD
     out[TRUSTED_STANDARD_COL] = bool_series(out[TRUSTED_STANDARD_COL])
@@ -300,27 +358,45 @@ def apply_q2_corrected_co_to_aligned(aligned: pd.DataFrame, cleaned: pd.DataFram
 def make_future_prediction_dataset(cleaned: pd.DataFrame) -> pd.DataFrame:
     df = cleaned.sort_values("序列").reset_index(drop=True).copy()
     horizon = max(1, CONTROL_EFFECT_HORIZON_S // SAMPLE_INTERVAL_S)
+    target_window = max(1, FUTURE_TARGET_WINDOW_S // SAMPLE_INTERVAL_S)
     co = pd.to_numeric(df[TARGET_COL], errors="coerce").to_numpy(dtype=float)
     trusted = trusted_standard_mask(df).to_numpy(dtype=bool)
     rows: list[dict[str, object]] = []
     co_lags = [0, 1, 2, 5, 10, 30, 60, 120, 150]
     start = max(max(co_lags), 15)
-    end = len(df) - horizon
+    end = len(df) - horizon - target_window + 1
     for pos in range(start, end):
-        future_pos = pos + horizon
+        future_start = pos + horizon
+        future_stop = future_start + target_window
         row_now = df.iloc[pos]
-        row_future = df.iloc[future_pos]
-        target_co = float(co[future_pos])
+        row_future = df.iloc[future_start]
+        row_future_end = df.iloc[future_stop - 1]
+        future_co_window = co[future_start:future_stop]
+        target_co = float(co[future_start])
+        window_median_co = float(np.nanmedian(future_co_window))
+        single_point_pass = bool(target_co <= EMISSION_STANDARD)
+        window_median_pass = bool(window_median_co <= EMISSION_STANDARD)
         item: dict[str, object] = {
             "序列": int(row_future["序列"]),
             "时间_s": float(row_future["时间_s"]),
+            "目标窗口起始序列": int(row_future["序列"]),
+            "目标窗口结束序列": int(row_future_end["序列"]),
+            "目标窗口起始时间_s": float(row_future["时间_s"]),
+            "目标窗口结束时间_s": float(row_future_end["时间_s"]),
+            "目标窗口长度_s": int(FUTURE_TARGET_WINDOW_S),
+            "目标窗口样本数": int(target_window),
             "控制序列": int(row_now["序列"]),
             "控制时间_s": float(row_now["时间_s"]),
             "预测提前量_s": int(CONTROL_EFFECT_HORIZON_S),
             TARGET_COL: target_co,
             Q2_CORRECTED_CO_COL: target_co,
-            TRUSTED_STANDARD_COL: bool(trusted[future_pos]),
-            "未来CO是否低于2800": bool(target_co <= EMISSION_STANDARD),
+            TRUSTED_STANDARD_COL: single_point_pass,
+            SINGLE_POINT_PASS_COL: single_point_pass,
+            WINDOW_MEDIAN_PASS_COL: window_median_pass,
+            "未来CO是否低于2800": single_point_pass,
+            WINDOW_MEDIAN_CO_COL: window_median_co,
+            "未来窗口CO_P10": float(np.nanquantile(future_co_window, 0.10)),
+            "未来窗口CO_P90": float(np.nanquantile(future_co_window, 0.90)),
             "低排放潜力目标": float(np.clip(LOW_POTENTIAL_BASELINE_CO - target_co, 0.0, LOW_POTENTIAL_MAX)),
         }
         for lag in co_lags:
@@ -355,6 +431,8 @@ def make_future_prediction_dataset(cleaned: pd.DataFrame) -> pd.DataFrame:
     future.loc[order[val_end:], "数据集"] = "测试集"
     future.loc[trusted_standard_mask(future), "数据集"] = "训练集"
 
+    save_csv(future, DATA_MID / "未来300s后单点CO低排放潜力建模数据.csv")
+    save_csv(future, DATA_MID / "未来300s后窗口中位CO低排放潜力建模数据.csv")
     save_csv(future, DATA_MID / "未来300s低排放潜力建模数据.csv")
     split_summary = (
         future.groupby("数据集")
@@ -363,10 +441,14 @@ def make_future_prediction_dataset(cleaned: pd.DataFrame) -> pd.DataFrame:
             可信达标样本数=(TRUSTED_STANDARD_COL, lambda s: int(bool_series(s).sum())),
             未来CO均值=(TARGET_COL, "mean"),
             未来CO中位数=(TARGET_COL, "median"),
+            单点达标样本数=(SINGLE_POINT_PASS_COL, lambda s: int(bool_series(s).sum())),
+            窗口中位数达标样本数=(WINDOW_MEDIAN_PASS_COL, lambda s: int(bool_series(s).sum())),
         )
         .reset_index()
     )
     split_summary["可信达标比例_%"] = split_summary["可信达标样本数"] / split_summary["样本数"] * 100
+    split_summary["单点达标比例_%"] = split_summary["单点达标样本数"] / split_summary["样本数"] * 100
+    split_summary["窗口中位数达标比例_%"] = split_summary["窗口中位数达标样本数"] / split_summary["样本数"] * 100
     save_csv(split_summary, DATA_OUT / "未来300s建模数据划分摘要.csv")
     return future
 
@@ -465,13 +547,8 @@ def identify_low_emission_conditions(cleaned: pd.DataFrame) -> tuple[pd.DataFram
         stability_parts.append(rolling_std.fillna(rolling_std.median()).fillna(0.0) / scale)
     df["低排放稳定性评分"] = pd.concat(stability_parts, axis=1).mean(axis=1) if stability_parts else 0.0
 
-    abnormal_cols = [Q2_CO_REPAIRED_FLAG_COL, Q2_CO_SPIKE_FLAG_COL, Q2_CO_GLOBAL_FLAG_COL, ISOLATED_LOW_FLAG_COL]
-    abnormal_mask = pd.Series(False, index=df.index)
-    for col in abnormal_cols:
-        if col in df.columns:
-            abnormal_mask = abnormal_mask | bool_series(df[col])
-    valid = ~abnormal_mask
     co = pd.to_numeric(df[TARGET_COL], errors="coerce")
+    valid = co.notna()
     low_threshold = float(max(EMISSION_STANDARD, co.loc[valid].quantile(LOW_EMISSION_QUANTILE))) if valid.any() else float(max(EMISSION_STANDARD, co.quantile(LOW_EMISSION_QUANTILE)))
     low_candidate = valid & (co <= low_threshold)
     stable_threshold = float(df.loc[low_candidate, "低排放稳定性评分"].quantile(0.60)) if low_candidate.any() else float(df["低排放稳定性评分"].quantile(0.60))
@@ -553,7 +630,7 @@ def identify_low_emission_conditions(cleaned: pd.DataFrame) -> tuple[pd.DataFram
                 "低排放片段数": int(len(intervals)),
                 "低排放片段样本数": int(len(low_df)),
                 "最长低排放片段持续时间_s": int(intervals["持续时间_s"].max()) if not intervals.empty else 0,
-                "识别口径": f"修正CO<=max(2800,P{int(LOW_EMISSION_QUANTILE*100)})，剔除异常点，且大烟道/后段温度状态稳定，连续不少于{LOW_EMISSION_MIN_DURATION_S}s。",
+                "识别口径": f"原始CO<=max(2800,P{int(LOW_EMISSION_QUANTILE*100)})，低CO浓度不剔除，且大烟道/后段温度状态稳定，连续不少于{LOW_EMISSION_MIN_DURATION_S}s。",
             }
         ]
     )
@@ -595,11 +672,12 @@ def make_adjustment_constraints(ranges: pd.DataFrame, cleaned: pd.DataFrame) -> 
             "Delta_i口径": f"clip({SINGLE_ADJUST_FRACTION:.2f}*(P90-P10), {SINGLE_ADJUST_MIN}, {SINGLE_ADJUST_MAX})",
             "总调节预算B": total_budget,
             "B口径": f"{TOTAL_BUDGET_FRACTION:.2f}*sum(Delta_i)",
+            "方案B最小总调节量": SCHEME_B_MIN_ADJUST,
         }
     )
     save_csv(table, DATA_OUT / "调控约束参数.csv")
     save_csv(pd.DataFrame(adjacent_rows), DATA_OUT / "相邻风箱约束参数.csv")
-    return {"single_delta": single_delta, "adjacent_limits": adjacent_limits, "total_budget": total_budget}
+    return {"single_delta": single_delta, "adjacent_limits": adjacent_limits, "total_budget": total_budget, "min_adjust": SCHEME_B_MIN_ADJUST}
 
 
 def load_dependencies() -> dict[str, Path]:
@@ -779,8 +857,14 @@ class LayeredCOModel:
     global_near_classifier: object | None = None
     regime_near_classifiers: dict[int, object] | None = None
     global_q05_regressor: object | None = None
+    global_q50_regressor: object | None = None
+    global_q90_regressor: object | None = None
     tail_q10_regressor: object | None = None
     tail_q05_regressor: object | None = None
+    tail_q50_regressor: object | None = None
+    tail_q90_regressor: object | None = None
+    global_low_layer_classifier: object | None = None
+    regime_low_layer_classifiers: dict[int, object] | None = None
 
     def assign_regime(self, frame: pd.DataFrame) -> np.ndarray:
         x_regime = frame[self.regime_feature_names].to_numpy(dtype=float)
@@ -788,7 +872,7 @@ class LayeredCOModel:
         if "达标模板中心_标准化空间" in self.extra and "达标模板距离阈值" in self.extra:
             center = np.asarray(self.extra["达标模板中心_标准化空间"], dtype=float)
             thresholds = np.asarray(self.extra["达标模板距离阈值"], dtype=float)
-            dist = np.sqrt(np.mean((z - center) ** 2, axis=1))
+            dist = self.template_distance(frame)
             labels = np.full(len(frame), 2, dtype=int)
             labels[dist <= thresholds[1]] = 1
             labels[dist <= thresholds[0]] = 0
@@ -796,6 +880,12 @@ class LayeredCOModel:
         if self.regime_clusterer is None:
             return np.zeros(len(frame), dtype=int)
         return np.asarray(self.regime_clusterer.predict(z), dtype=int)
+
+    def template_distance(self, frame: pd.DataFrame) -> np.ndarray:
+        x_regime = frame[self.regime_feature_names].to_numpy(dtype=float)
+        z = self.regime_scaler.transform(x_regime)
+        center = np.asarray(self.extra.get("达标模板中心_标准化空间", np.zeros(z.shape[1])), dtype=float)
+        return np.sqrt(np.mean((z - center) ** 2, axis=1))
 
     def _predict_regressor(self, frame: pd.DataFrame, regressor: object, regime_regressors: dict[int, object] | None = None) -> np.ndarray:
         x = frame[self.feature_names].to_numpy(dtype=float)
@@ -808,21 +898,96 @@ class LayeredCOModel:
                     pred[mask] = np.asarray(local_regressor.predict(x[mask]), dtype=float)
         return pred
 
-    def predict_low_quantile(self, frame: pd.DataFrame, alpha: float = Q10_ALPHA) -> np.ndarray:
-        if alpha <= Q05_ALPHA + 1e-8:
-            global_regressor = self.global_q05_regressor if self.global_q05_regressor is not None else self.global_regressor
-            tail_regressor = self.tail_q05_regressor if self.tail_q05_regressor is not None else global_regressor
+    def _blend_regressor_prediction(
+        self,
+        frame: pd.DataFrame,
+        global_regressor: object,
+        tail_regressor: object | None,
+        regime_regressors: dict[int, object] | None = None,
+        dynamic_alpha: bool = False,
+    ) -> np.ndarray:
+        global_pred = self._predict_regressor(frame, global_regressor, regime_regressors)
+        tail_pred = self._predict_regressor(frame, tail_regressor if tail_regressor is not None else global_regressor, None)
+        if dynamic_alpha:
+            blend = self.tail_alpha(frame)
         else:
-            global_regressor = self.global_regressor
-            tail_regressor = self.tail_q10_regressor if self.tail_q10_regressor is not None else global_regressor
-        global_pred = self._predict_regressor(frame, global_regressor, self.regime_regressors if alpha > Q05_ALPHA + 1e-8 else None)
-        tail_pred = self._predict_regressor(frame, tail_regressor, None)
-        blend = float(self.extra.get("尾部融合权重", 0.5))
+            blend = float(self.extra.get("尾部融合权重", 0.5))
         return np.clip((1.0 - blend) * global_pred + blend * tail_pred, 0.0, None)
 
+    def predict_quantile_dict(self, frame: pd.DataFrame) -> dict[str, np.ndarray]:
+        q05_raw = self._blend_regressor_prediction(
+            frame,
+            self.global_q05_regressor if self.global_q05_regressor is not None else self.global_regressor,
+            self.tail_q05_regressor,
+            None,
+        )
+        q10_raw = self._blend_regressor_prediction(
+            frame,
+            self.global_regressor,
+            self.tail_q10_regressor,
+            self.regime_regressors,
+        )
+        q50_raw = self._blend_regressor_prediction(
+            frame,
+            self.global_q50_regressor if self.global_q50_regressor is not None else self.global_regressor,
+            self.tail_q50_regressor,
+            None,
+            True,
+        )
+        q90_raw = self._blend_regressor_prediction(
+            frame,
+            self.global_q90_regressor if self.global_q90_regressor is not None else (self.global_q50_regressor if self.global_q50_regressor is not None else self.global_regressor),
+            self.tail_q90_regressor,
+            None,
+        )
+        raw = np.column_stack([q05_raw, q10_raw, q50_raw, q90_raw])
+        sorted_q = np.sort(np.clip(raw, 0.0, None), axis=1)
+        return {
+            "q05": sorted_q[:, 0],
+            "q10": sorted_q[:, 1],
+            "q50": sorted_q[:, 2],
+            "q90": sorted_q[:, 3],
+            "q05_raw": q05_raw,
+            "q10_raw": q10_raw,
+            "q50_raw": q50_raw,
+            "q90_raw": q90_raw,
+            "pr_low": self.predict_low_layer_probability(frame),
+            "tail_alpha": self.tail_alpha(frame),
+        }
+
+    def predict_low_quantile(self, frame: pd.DataFrame, alpha: float = Q10_ALPHA) -> np.ndarray:
+        if alpha <= Q05_ALPHA + 1e-8:
+            return self._blend_regressor_prediction(
+                frame,
+                self.global_q05_regressor if self.global_q05_regressor is not None else self.global_regressor,
+                self.tail_q05_regressor,
+                None,
+            )
+        if alpha >= Q90_ALPHA - 1e-8:
+            return self._blend_regressor_prediction(
+                frame,
+                self.global_q90_regressor if self.global_q90_regressor is not None else (self.global_q50_regressor if self.global_q50_regressor is not None else self.global_regressor),
+                self.tail_q90_regressor,
+                None,
+            )
+        if alpha >= Q50_ALPHA - 1e-8:
+            return self._blend_regressor_prediction(
+                frame,
+                self.global_q50_regressor if self.global_q50_regressor is not None else self.global_regressor,
+                self.tail_q50_regressor,
+                None,
+                True,
+            )
+        return self._blend_regressor_prediction(
+            frame,
+            self.global_regressor,
+            self.tail_q10_regressor,
+            self.regime_regressors,
+        )
+
     def ridge_predict(self, frame: pd.DataFrame) -> np.ndarray:
-        if self.extra.get("回归目标") in {"Q10/Q05达标潜力", "低分位CO"}:
-            return self.predict_low_quantile(frame, Q10_ALPHA)
+        if self.extra.get("回归目标") in {"Q10/Q05达标潜力", "Q05/Q10/Q50/Q90达标潜力", "低分位CO"}:
+            return self.predict_low_quantile(frame, Q50_ALPHA)
         pred = self._predict_regressor(frame, self.global_regressor, self.regime_regressors)
         if self.extra.get("回归目标") == "低排放潜力":
             pred = np.clip(pred, 0.0, float(self.extra.get("低排放潜力上限", LOW_POTENTIAL_MAX)))
@@ -839,12 +1004,41 @@ class LayeredCOModel:
                 prob[mask] = np.asarray(classifier.predict_proba(x[mask])[:, 1], dtype=float)
         return prob
 
-    def predict_near_probability(self, frame: pd.DataFrame) -> np.ndarray:
+    def _predict_near_probability_raw(self, frame: pd.DataFrame) -> np.ndarray:
         classifier = self.global_near_classifier if self.global_near_classifier is not None else self.global_classifier
         return self._predict_probability(frame, classifier, self.regime_near_classifiers)
 
-    def predict_strict_probability(self, frame: pd.DataFrame) -> np.ndarray:
+    def _predict_strict_probability_raw(self, frame: pd.DataFrame) -> np.ndarray:
         return self._predict_probability(frame, self.global_classifier, self.regime_classifiers)
+
+    def predict_low_layer_probability(self, frame: pd.DataFrame) -> np.ndarray:
+        if self.global_low_layer_classifier is None:
+            regimes = self.assign_regime(frame)
+            return np.clip(np.where(regimes == 0, 1.0, np.where(regimes == 1, 0.45, 0.05)), 0.0, 1.0)
+        return self._predict_probability(frame, self.global_low_layer_classifier, self.regime_low_layer_classifiers)
+
+    def tail_alpha(self, frame: pd.DataFrame) -> np.ndarray:
+        p_low = self.predict_low_layer_probability(frame)
+        lo = float(self.extra.get("alpha低排放概率下限", LOW_LAYER_ALPHA_FLOOR))
+        hi = float(self.extra.get("alpha低排放概率上限", LOW_LAYER_ALPHA_CEIL))
+        if hi <= lo:
+            return np.clip(p_low, 0.0, 1.0)
+        return np.clip((p_low - lo) / (hi - lo), 0.0, 1.0)
+
+    def predict_nested_probabilities(self, frame: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
+        near_raw = self._predict_near_probability_raw(frame)
+        strict_raw = self._predict_strict_probability_raw(frame)
+        near = np.maximum(near_raw, strict_raw)
+        strict = np.minimum(strict_raw, near)
+        return np.clip(near, 0.0, 1.0), np.clip(strict, 0.0, 1.0)
+
+    def predict_near_probability(self, frame: pd.DataFrame) -> np.ndarray:
+        near, _ = self.predict_nested_probabilities(frame)
+        return near
+
+    def predict_strict_probability(self, frame: pd.DataFrame) -> np.ndarray:
+        _, strict = self.predict_nested_probabilities(frame)
+        return strict
 
     def predict_standard_probability(self, frame: pd.DataFrame) -> np.ndarray:
         return self.predict_strict_probability(frame)
@@ -1107,14 +1301,14 @@ def fit_nonlinear_control_model(aligned: pd.DataFrame, monitor_model: LinearCOMo
 def select_regime_feature_names(feature_cols: list[str]) -> list[str]:
     selected: list[str] = []
     for name in feature_cols:
-        if name.startswith(SPEED_COL):
+        if name.startswith(CO_HISTORY_PREFIX) or name.startswith("CO状态__"):
+            selected.append(name)
+        elif name.startswith(SPEED_COL):
+            selected.append(name)
+        elif "风箱负压强度__lag" in name or "风箱平均温度__lag" in name:
             selected.append(name)
         elif "大烟道负压强度" in name or "大烟道温度" in name:
             selected.append(name)
-        else:
-            m = re.match(r"^(\d+)#风箱平均温度__lag\d+$", name)
-            if m and int(m.group(1)) >= 13:
-                selected.append(name)
     if len(selected) < 4:
         selected = feature_cols[: min(len(feature_cols), 12)]
     return selected
@@ -1145,6 +1339,19 @@ def make_quantile_regressor(alpha: float, random_state: int, min_samples_leaf: i
     )
 
 
+def make_fast_quantile_regressor(alpha: float, random_state: int, min_samples_leaf: int = 8) -> GradientBoostingRegressor:
+    return GradientBoostingRegressor(
+        loss="quantile",
+        alpha=alpha,
+        n_estimators=120,
+        learning_rate=0.05,
+        max_depth=2,
+        min_samples_leaf=min_samples_leaf,
+        subsample=0.85,
+        random_state=random_state,
+    )
+
+
 def make_hgb_classifier(y_bin: np.ndarray, probability: float, random_state: int) -> object:
     if len(np.unique(y_bin.astype(bool))) < 2:
         return ConstantProbabilityClassifier(probability=probability)
@@ -1152,6 +1359,19 @@ def make_hgb_classifier(y_bin: np.ndarray, probability: float, random_state: int
         max_iter=210,
         learning_rate=0.05,
         max_leaf_nodes=15,
+        min_samples_leaf=12,
+        l2_regularization=0.08,
+        random_state=random_state,
+    )
+
+
+def make_fast_hgb_classifier(y_bin: np.ndarray, probability: float, random_state: int) -> object:
+    if len(np.unique(y_bin.astype(bool))) < 2:
+        return ConstantProbabilityClassifier(probability=probability)
+    return HistGradientBoostingClassifier(
+        max_iter=80,
+        learning_rate=0.07,
+        max_leaf_nodes=11,
         min_samples_leaf=12,
         l2_regularization=0.08,
         random_state=random_state,
@@ -1290,7 +1510,7 @@ def fit_layered_control_model(aligned: pd.DataFrame, monitor_model: LinearCOMode
         "达标模板距离阈值": [threshold_near, threshold_mid],
         "可信达标样本权重": 30.0,
         "近达标样本权重": 5.0,
-        "说明": "不再使用KMeans命名达标层；先以42条可信达标样本形成达标模板中心，再按工况特征到达标模板的距离划分邻域/过渡/远离三层，每层单独训练调控响应模型。",
+        "说明": f"不再使用KMeans命名达标层；先以{int(y_standard.sum())}条原始单点CO<=2800样本形成达标模板中心，低CO浓度不剔除，再按工况特征到达标模板的距离划分邻域/过渡/远离三层，每层单独训练调控响应模型。",
     }
     model = LayeredCOModel(
         name="分层低排放调控响应模型",
@@ -1390,13 +1610,24 @@ def fit_future_tail_control_model(future: pd.DataFrame) -> tuple[LayeredCOModel,
     meta_cols = {
         "序列",
         "时间_s",
+        "目标窗口起始序列",
+        "目标窗口结束序列",
+        "目标窗口起始时间_s",
+        "目标窗口结束时间_s",
+        "目标窗口长度_s",
+        "目标窗口样本数",
         "控制序列",
         "控制时间_s",
         "预测提前量_s",
         TARGET_COL,
         Q2_CORRECTED_CO_COL,
         TRUSTED_STANDARD_COL,
+        SINGLE_POINT_PASS_COL,
+        WINDOW_MEDIAN_PASS_COL,
         "未来CO是否低于2800",
+        WINDOW_MEDIAN_CO_COL,
+        "未来窗口CO_P10",
+        "未来窗口CO_P90",
         "低排放潜力目标",
         "数据集",
     }
@@ -1407,6 +1638,8 @@ def fit_future_tail_control_model(future: pd.DataFrame) -> tuple[LayeredCOModel,
     y_near = y_future <= NEAR_STANDARD
     y_trusted = trusted_standard_mask(future).to_numpy(dtype=bool)
     train_mask = (future["数据集"] == "训练集").to_numpy(dtype=bool)
+    strict_train_count = int((train_mask & y_strict).sum())
+    strict_probability_constraint_enabled = strict_train_count >= 20
 
     sample_weight = np.ones(len(future), dtype=float)
     sample_weight[y_near] = 6.0
@@ -1431,6 +1664,7 @@ def fit_future_tail_control_model(future: pd.DataFrame) -> tuple[LayeredCOModel,
     regime_labels[dist_all <= threshold_mid] = 1
     regime_labels[dist_all <= threshold_near] = 0
     regime_labels[y_strict | y_trusted] = 0
+    y_low_layer = regime_labels == 0
 
     tail_core = y_future <= NEAR_STANDARD
     if (train_mask & tail_core).any():
@@ -1454,10 +1688,18 @@ def fit_future_tail_control_model(future: pd.DataFrame) -> tuple[LayeredCOModel,
     global_regressor.fit(x[train_mask], y_future[train_mask], sample_weight=sample_weight[train_mask])
     global_q05_regressor = make_quantile_regressor(Q05_ALPHA, 53, min_samples_leaf=6)
     global_q05_regressor.fit(x[train_mask], y_future[train_mask], sample_weight=sample_weight[train_mask])
+    global_q50_regressor = make_quantile_regressor(Q50_ALPHA, 56, min_samples_leaf=6)
+    global_q50_regressor.fit(x[train_mask], y_future[train_mask], sample_weight=sample_weight[train_mask])
+    global_q90_regressor = make_quantile_regressor(Q90_ALPHA, 57, min_samples_leaf=6)
+    global_q90_regressor.fit(x[train_mask], y_future[train_mask], sample_weight=sample_weight[train_mask])
     tail_q10_regressor = make_quantile_regressor(Q10_ALPHA, 152, min_samples_leaf=4)
     tail_q10_regressor.fit(x[tail_train_mask], y_future[tail_train_mask], sample_weight=tail_weight[tail_train_mask])
     tail_q05_regressor = make_quantile_regressor(Q05_ALPHA, 153, min_samples_leaf=4)
     tail_q05_regressor.fit(x[tail_train_mask], y_future[tail_train_mask], sample_weight=tail_weight[tail_train_mask])
+    tail_q50_regressor = make_quantile_regressor(Q50_ALPHA, 156, min_samples_leaf=4)
+    tail_q50_regressor.fit(x[tail_train_mask], y_future[tail_train_mask], sample_weight=tail_weight[tail_train_mask])
+    tail_q90_regressor = make_quantile_regressor(Q90_ALPHA, 157, min_samples_leaf=4)
+    tail_q90_regressor.fit(x[tail_train_mask], y_future[tail_train_mask], sample_weight=tail_weight[tail_train_mask])
 
     classifier_weight = np.ones(len(future), dtype=float)
     classifier_weight[y_near] = 5.0
@@ -1468,10 +1710,18 @@ def fit_future_tail_control_model(future: pd.DataFrame) -> tuple[LayeredCOModel,
     global_classifier = make_hgb_classifier(y_strict[train_mask], float(y_strict[train_mask].mean()), 55)
     if not isinstance(global_classifier, ConstantProbabilityClassifier):
         global_classifier.fit(x[train_mask], y_strict[train_mask], sample_weight=classifier_weight[train_mask])
+    low_layer_weight = np.ones(len(future), dtype=float)
+    low_layer_weight[y_near] = 3.0
+    low_layer_weight[y_low_layer] = 10.0
+    low_layer_weight[y_strict | y_trusted] = 25.0
+    global_low_layer_classifier = make_hgb_classifier(y_low_layer[train_mask], float(y_low_layer[train_mask].mean()), 58)
+    if not isinstance(global_low_layer_classifier, ConstantProbabilityClassifier):
+        global_low_layer_classifier.fit(x[train_mask], y_low_layer[train_mask], sample_weight=low_layer_weight[train_mask])
 
     regime_regressors: dict[int, object] = {}
     regime_classifiers: dict[int, object] = {}
     regime_near_classifiers: dict[int, object] = {}
+    regime_low_layer_classifiers: dict[int, object] = {}
     for regime_id in range(3):
         mask = train_mask & (regime_labels == regime_id)
         if int(mask.sum()) < 30:
@@ -1493,15 +1743,26 @@ def fit_future_tail_control_model(future: pd.DataFrame) -> tuple[LayeredCOModel,
         save_csv(regime_profiles, DATA_OUT / "工况分层画像.csv")
 
     extra = {
-        "模型类型": "未来300s Q10/Q05达标潜力模型 + 全局/尾部融合 + 两级达标分类器",
+        "模型类型": "未来300s Q05/Q10/Q50/Q90达标潜力模型 + 全局/尾部融合 + 两级嵌套达标分类器",
         "特征形式": "当前CO状态+当前过程变量+负压调节量",
-        "回归目标": "Q10/Q05达标潜力",
-        "主优化低分位": "Q10_CO",
+        "回归目标": "Q05/Q10/Q50/Q90达标潜力",
+        "主优化分位": "Q50_CO",
+        "约束分位": "Q10_CO<=2700",
+        "保守风险上界": "Q90_CO",
         "理论极限低分位": "Q05_CO",
+        "Q50全局尾部融合公式": "Q50_final=(1-alpha)*Q50_global+alpha*Q50_tail, alpha=f(Pr_low)",
         "Q10全局尾部融合公式": "CO_low_final=0.5*Q10_global+0.5*Q10_tail",
         "Q05全局尾部融合公式": "CO_low_extreme=0.5*Q05_global+0.5*Q05_tail",
+        "分位数单调修正": "预测后对Q05/Q10/Q50/Q90逐样本排序，消除分位数交叉",
+        "Q10低排放潜力指标阈值": Q10_CONSTRAINT_STANDARD,
+        "Q50期望阈值": Q50_DESIRED_STANDARD,
+        "规划概率阈值θ": PLANNING_PROBABILITY_THRESHOLD,
+        "Q10指标说明": "Q10<=2700仅作为低排放潜力指标，不作为规划硬约束",
         "尾部融合权重": 0.5,
+        "alpha低排放概率下限": LOW_LAYER_ALPHA_FLOOR,
+        "alpha低排放概率上限": LOW_LAYER_ALPHA_CEIL,
         "预测提前量_s": CONTROL_EFFECT_HORIZON_S,
+        "目标窗口长度_s": FUTURE_TARGET_WINDOW_S,
         "工况分层特征": regime_features,
         "达标模板中心_标准化空间": trusted_center.tolist(),
         "达标模板距离阈值": [threshold_near, threshold_mid],
@@ -1512,11 +1773,22 @@ def fit_future_tail_control_model(future: pd.DataFrame) -> tuple[LayeredCOModel,
         "全局权重_2800到3200": 6.0,
         "尾部权重_CO<=2800": 30.0,
         "尾部权重_2800到3200": 8.0,
-        "两级分类器": "Pr_near=Pr(CO<=3200), Pr_strict=Pr(CO<=2800)",
-        "说明": "保留历史CO作为状态变量，使用当前过程变量和负压调节量预测未来300s低分位CO；全局Q10/Q05模型用全部样本训练，尾部Q10/Q05模型只用CO<=3200及其达标模板邻域样本训练，并对CO<=2800加高权重。",
+        "两级分类器": "Pr_near=Pr(CO<=3200), Pr_strict=Pr(CO<=2800)，预测后强制Pr_near>=Pr_strict",
+        "低排放工况层分类器": "Pr_low=Pr(进入可信达标模板邻域/低排放工况层)，用于动态融合Q50_global和Q50_tail",
+        "训练集single_point_pass正样本数": strict_train_count,
+        "全样本single_point_pass正样本数": int(y_strict.sum()),
+        "全样本window_median_pass正样本数": int(bool_series(future[WINDOW_MEDIAN_PASS_COL]).sum()) if WINDOW_MEDIAN_PASS_COL in future.columns else 0,
+        "训练集window_median_pass正样本数": int(bool_series(future.loc[train_mask, WINDOW_MEDIAN_PASS_COL]).sum()) if WINDOW_MEDIAN_PASS_COL in future.columns else 0,
+        "Pr_strict优化约束启用": bool(strict_probability_constraint_enabled),
+        "达标概率柔性约束": (
+            f"训练集single_point_pass正样本数={strict_train_count}，启用Pr_strict软约束"
+            if strict_probability_constraint_enabled
+            else f"训练集single_point_pass正样本数={strict_train_count}<20，Pr_strict仅诊断不筛选"
+        ),
+        "说明": "保留历史CO作为状态变量，使用当前过程变量和负压调节量预测300s后单点CO；Q50_point为主优化目标，Q10_point<=2700作为约束，窗口中位数只作为稳定性风险诊断。",
     }
     model = LayeredCOModel(
-        name="未来300s Q10/Q05达标潜力调控模型",
+        name="未来300s Q05/Q10/Q50/Q90达标潜力调控模型",
         feature_names=feature_cols,
         regime_feature_names=regime_features,
         regime_scaler=scaler,
@@ -1530,14 +1802,55 @@ def fit_future_tail_control_model(future: pd.DataFrame) -> tuple[LayeredCOModel,
         global_near_classifier=global_near_classifier,
         regime_near_classifiers=regime_near_classifiers,
         global_q05_regressor=global_q05_regressor,
+        global_q50_regressor=global_q50_regressor,
+        global_q90_regressor=global_q90_regressor,
         tail_q10_regressor=tail_q10_regressor,
         tail_q05_regressor=tail_q05_regressor,
+        tail_q50_regressor=tail_q50_regressor,
+        tail_q90_regressor=tail_q90_regressor,
+        global_low_layer_classifier=global_low_layer_classifier,
+        regime_low_layer_classifiers=regime_low_layer_classifiers,
     )
 
-    pred_all = model.ridge_predict(future)
-    pred_q05_all = model.predict_low_quantile(future, Q05_ALPHA)
+    quantile_all = model.predict_quantile_dict(future)
+    pred_q05_all = quantile_all["q05"]
+    pred_all = quantile_all["q10"]
+    pred_q50_all = quantile_all["q50"]
+    pred_q90_all = quantile_all["q90"]
+    raw_cross_q05_q10 = int(np.sum(quantile_all["q05_raw"] > quantile_all["q10_raw"] + 1e-8))
+    raw_cross_q10_q50 = int(np.sum(quantile_all["q10_raw"] > quantile_all["q50_raw"] + 1e-8))
+    raw_cross_q50_q90 = int(np.sum(quantile_all["q50_raw"] > quantile_all["q90_raw"] + 1e-8))
+    if hasattr(model, "_predict_near_probability_raw") and hasattr(model, "_predict_strict_probability_raw"):
+        prob_near_raw = model._predict_near_probability_raw(future)
+        prob_strict_raw = model._predict_strict_probability_raw(future)
+        raw_prob_cross = int(np.sum(prob_strict_raw > prob_near_raw + 1e-8))
+    else:
+        prob_near_raw = np.full(len(future), np.nan)
+        prob_strict_raw = np.full(len(future), np.nan)
+        raw_prob_cross = 0
     prob_near_all = model.predict_near_probability(future)
     prob_strict_all = model.predict_standard_probability(future)
+    prob_low_layer_all = model.predict_low_layer_probability(future)
+    tail_alpha_all = model.tail_alpha(future)
+    monotonic_diag = pd.DataFrame(
+        [
+            {
+                "样本数": int(len(future)),
+                "原始Q05大于Q10样本数": raw_cross_q05_q10,
+                "原始Q10大于Q50样本数": raw_cross_q10_q50,
+                "原始Q50大于Q90样本数": raw_cross_q50_q90,
+                "修正后分位数交叉样本数": int(
+                    np.sum((pred_q05_all > pred_all + 1e-8) | (pred_all > pred_q50_all + 1e-8) | (pred_q50_all > pred_q90_all + 1e-8))
+                ),
+                "原始Pr_strict大于Pr_near样本数": raw_prob_cross,
+                "修正后概率嵌套违规样本数": int(np.sum(prob_strict_all > prob_near_all + 1e-8)),
+                "Pr_low均值": float(np.nanmean(prob_low_layer_all)),
+                "Q50动态尾部alpha均值": float(np.nanmean(tail_alpha_all)),
+                "修正口径": "Q05/Q10/Q50/Q90逐样本排序；Pr_near=max(raw_near,raw_strict)，Pr_strict保留严格分类器输出并满足Pr_strict<=Pr_near。",
+            }
+        ]
+    )
+    save_csv(monotonic_diag, DATA_OUT / "分位数与分类概率单调诊断.csv")
     rows = []
     for split_name in ["训练集", "验证集", "测试集"]:
         mask = (future["数据集"] == split_name).to_numpy(dtype=bool)
@@ -1548,15 +1861,27 @@ def fit_future_tail_control_model(future: pd.DataFrame) -> tuple[LayeredCOModel,
         near_metrics = classification_metrics(np.asarray(y_near[mask], dtype=bool), prob_near_all[mask])
         rows.append(
             {
-                "模型": "未来300s Q10/Q05达标潜力调控模型",
+                "模型": "未来300s Q05/Q10/Q50/Q90达标潜力调控模型",
                 "数据集": split_name,
                 "样本数": int(mask.sum()),
-                **regression_metrics(y_future[mask], pred_all[mask]),
-                "MAE": float(mean_absolute_error(y_future[mask], pred_all[mask])),
+                **regression_metrics(y_future[mask], pred_q50_all[mask]),
+                "MAE": float(mean_absolute_error(y_future[mask], pred_q50_all[mask])),
+                "主目标分位": "Q50_CO",
+                "Q10低排放潜力指标阈值": Q10_CONSTRAINT_STANDARD,
                 "Q05_MAE": float(mean_absolute_error(y_future[mask], pred_q05_all[mask])),
+                "Q10_MAE": float(mean_absolute_error(y_future[mask], pred_all[mask])),
+                "Q50_MAE": float(mean_absolute_error(y_future[mask], pred_q50_all[mask])),
+                "Q90_MAE": float(mean_absolute_error(y_future[mask], pred_q90_all[mask])),
                 "严格达标样本Q10_MAE": float(mean_absolute_error(y_future[mask][low_mask], pred_all[mask][low_mask])) if low_mask.any() else np.nan,
                 "Q10预测CO低于2800比例_%": float(np.mean(pred_all[mask] <= EMISSION_STANDARD) * 100),
+                "Q10低排放潜力指标满足比例_%": float(np.mean(pred_all[mask] <= Q10_CONSTRAINT_STANDARD) * 100),
+                "Q10低排放潜力指标满足比例_%": float(np.mean(pred_all[mask] <= ROBUST_STANDARD) * 100),
                 "Q05预测CO低于2800比例_%": float(np.mean(pred_q05_all[mask] <= EMISSION_STANDARD) * 100),
+                "Q50预测CO低于2800比例_%": float(np.mean(pred_q50_all[mask] <= EMISSION_STANDARD) * 100),
+                "Q50预测CO低于基准比例_%": float(np.mean(pred_q50_all[mask] <= y_future[mask]) * 100),
+                "Q90预测CO高于3200比例_%": float(np.mean(pred_q90_all[mask] > NEAR_STANDARD) * 100),
+                "Pr_low均值": float(np.nanmean(prob_low_layer_all[mask])),
+                "Q50动态尾部alpha均值": float(np.nanmean(tail_alpha_all[mask])),
                 "真实严格达标比例_%": float(np.mean(low_mask) * 100),
                 "真实近达标比例_%": float(np.mean(y_near[mask]) * 100),
                 **strict_metrics,
@@ -1577,7 +1902,7 @@ def fit_future_tail_control_model(future: pd.DataFrame) -> tuple[LayeredCOModel,
     baseline_rmse = float(np.sqrt(np.mean((model.ridge_predict(eval_frame) - y_eval) ** 2)))
     rng = np.random.default_rng(42)
     importance_rows = []
-    for feature in feature_cols[: min(60, len(feature_cols))]:
+    for feature in feature_cols:
         perm_frame = eval_frame.copy()
         values = perm_frame[feature].to_numpy(dtype=float).copy()
         rng.shuffle(values)
@@ -1594,8 +1919,8 @@ def fit_future_tail_control_model(future: pd.DataFrame) -> tuple[LayeredCOModel,
     payload = {
         "模型名称": model.name,
         "模型类型": extra["模型类型"],
-        "目标字段": "未来300s后CO",
-        "回归目标": "Q10/Q05达标潜力",
+        "目标字段": "300s后单点CO",
+        "回归目标": "Q50_point主目标 + Q10_point约束 + Q90_point风险上界",
         "特征字段": feature_cols,
         "训练权重说明": extra,
         "工况分层画像": regime_profiles.to_dict(orient="records"),
@@ -1636,8 +1961,17 @@ def audit_trusted_standard_predictions(aligned: pd.DataFrame, control_model: obj
         save_csv(summary, DATA_OUT / "可信达标样本_调控模型预测复核摘要.csv")
         return detail, summary, {"probability_effective": False, "model_erases_standard_region": True}
 
-    pred = control_model.ridge_predict(audit_source)
-    pred_q05 = control_model.predict_low_quantile(audit_source, Q05_ALPHA) if hasattr(control_model, "predict_low_quantile") else pred
+    if hasattr(control_model, "predict_quantile_dict"):
+        quantiles = control_model.predict_quantile_dict(audit_source)
+        pred_q05 = quantiles["q05"]
+        pred = quantiles["q10"]
+        pred_q50 = quantiles["q50"]
+        pred_q90 = quantiles["q90"]
+    else:
+        pred = control_model.ridge_predict(audit_source)
+        pred_q05 = control_model.predict_low_quantile(audit_source, Q05_ALPHA) if hasattr(control_model, "predict_low_quantile") else pred
+        pred_q50 = pred
+        pred_q90 = pred
     prob_near = control_model.predict_near_probability(audit_source) if hasattr(control_model, "predict_near_probability") else np.zeros(len(audit_source))
     prob = control_model.predict_standard_probability(audit_source) if hasattr(control_model, "predict_standard_probability") else np.zeros(len(audit_source))
     regimes = control_model.assign_regime(audit_source) if hasattr(control_model, "assign_regime") else np.full(len(audit_source), -1, dtype=int)
@@ -1648,13 +1982,18 @@ def audit_trusted_standard_predictions(aligned: pd.DataFrame, control_model: obj
     detail = detail.rename(columns={TARGET_COL: "真实修正CO"})
     detail["Q10_CO_low_final"] = pred
     detail["Q05_CO_low_extreme"] = pred_q05
+    detail["Q50_CO"] = pred_q50
+    detail["Q90_CO"] = pred_q90
     detail["调控模型预测CO"] = pred
     detail["近达标概率Pr_CO_le_3200"] = prob_near
     detail["严格达标概率Pr_CO_le_2800"] = prob
     detail["分类器达标概率"] = prob
     detail["预测误差_预测减真实"] = detail["Q10_CO_low_final"] - detail["真实修正CO"]
     detail["预测是否低于2800"] = detail["Q10_CO_low_final"] <= EMISSION_STANDARD
+    detail["预测是否满足Q10低排放潜力指标"] = detail["Q10_CO_low_final"] <= ROBUST_STANDARD
     detail["Q05预测是否低于2800"] = detail["Q05_CO_low_extreme"] <= EMISSION_STANDARD
+    detail["分位数是否单调"] = (detail["Q05_CO_low_extreme"] <= detail["Q10_CO_low_final"]) & (detail["Q10_CO_low_final"] <= detail["Q50_CO"]) & (detail["Q50_CO"] <= detail["Q90_CO"])
+    detail["概率是否嵌套"] = detail["近达标概率Pr_CO_le_3200"] + 1e-8 >= detail["严格达标概率Pr_CO_le_2800"]
     detail["预测是否3000以上"] = detail["Q10_CO_low_final"] >= 3000
     detail["所属工况层"] = regimes
     detail["所属工况层名称"] = [regime_names.get(int(r), f"工况层{int(r)}") for r in regimes]
@@ -1681,6 +2020,12 @@ def audit_trusted_standard_predictions(aligned: pd.DataFrame, control_model: obj
                 "平均预测CO": float(detail["Q10_CO_low_final"].mean()),
                 "预测CO中位数": float(detail["Q10_CO_low_final"].median()),
                 "平均Q05_CO": float(detail["Q05_CO_low_extreme"].mean()),
+                "平均Q50_CO": float(detail["Q50_CO"].mean()),
+                "平均Q90_CO": float(detail["Q90_CO"].mean()),
+                "满足Q10低排放潜力指标样本数": int(detail["预测是否满足Q10低排放潜力指标"].sum()),
+                "满足Q10低排放潜力指标比例_%": float(detail["预测是否满足Q10低排放潜力指标"].mean() * 100),
+                "分位数单调样本比例_%": float(detail["分位数是否单调"].mean() * 100),
+                "概率嵌套样本比例_%": float(detail["概率是否嵌套"].mean() * 100),
                 "平均近达标概率": float(np.nanmean(prob_near)),
                 "平均预测误差": float(detail["预测误差_预测减真实"].mean()),
                 "平均达标概率": float(np.nanmean(prob)),
@@ -1693,6 +2038,151 @@ def audit_trusted_standard_predictions(aligned: pd.DataFrame, control_model: obj
     save_csv(detail, DATA_OUT / "可信达标样本_调控模型预测复核.csv")
     save_csv(summary, DATA_OUT / "可信达标样本_调控模型预测复核摘要.csv")
     return detail, summary, {"probability_effective": probability_effective, "model_erases_standard_region": erases}
+
+
+def leave_one_compliant_segment_validation(future: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    trusted = trusted_standard_mask(future).to_numpy(dtype=bool)
+    ordered = future.sort_values("序列").reset_index(drop=False).copy()
+    ordered_trusted = trusted_standard_mask(ordered).to_numpy(dtype=bool)
+    run_id = pd.Series(ordered_trusted).ne(pd.Series(ordered_trusted).shift(fill_value=False)).cumsum().to_numpy()
+    ordered["达标连续片段编号"] = np.where(ordered_trusted, run_id, -1)
+    segments = []
+    for seg_id, part in ordered[ordered["达标连续片段编号"] >= 0].groupby("达标连续片段编号"):
+        segments.append(
+            {
+                "seg_id": int(seg_id),
+                "indices": part["index"].to_numpy(dtype=int),
+                "start_seq": int(part["序列"].min()),
+                "end_seq": int(part["序列"].max()),
+                "n": int(len(part)),
+            }
+        )
+    segments = sorted(segments, key=lambda item: (item["start_seq"], item["end_seq"]))[:5]
+    if not segments:
+        summary = pd.DataFrame(
+            [
+                {
+                    "验证结论": "未找到可信达标连续片段，无法进行留一验证。",
+                    "留出片段数": 0,
+                }
+            ]
+        )
+        detail = pd.DataFrame()
+        save_csv(summary, DATA_OUT / "达标片段留一验证.csv")
+        save_csv(detail, DATA_OUT / "达标片段留一验证明细.csv")
+        return summary, detail
+
+    meta_cols = {
+        "序列",
+        "时间_s",
+        "控制序列",
+        "控制时间_s",
+        "预测提前量_s",
+        TARGET_COL,
+        Q2_CORRECTED_CO_COL,
+        TRUSTED_STANDARD_COL,
+        "未来CO是否低于2800",
+        "低排放潜力目标",
+        "数据集",
+    }
+    feature_cols = [c for c in future.columns if c not in meta_cols]
+    x_all = future[feature_cols].to_numpy(dtype=float)
+    y_all = future[TARGET_COL].to_numpy(dtype=float)
+    y_near = y_all <= NEAR_STANDARD
+    y_strict = y_all <= EMISSION_STANDARD
+    summary_rows: list[dict[str, object]] = []
+    detail_rows: list[dict[str, object]] = []
+
+    for fold_id, seg in enumerate(segments, start=1):
+        holdout_idx = np.asarray(seg["indices"], dtype=int)
+        holdout_mask = np.zeros(len(future), dtype=bool)
+        holdout_mask[holdout_idx] = True
+        train_mask = ~holdout_mask
+        sample_weight = np.ones(len(future), dtype=float)
+        sample_weight[y_near] = 6.0
+        sample_weight[y_strict] = 18.0
+
+        q10_model = make_fast_quantile_regressor(Q10_ALPHA, 700 + fold_id, min_samples_leaf=8)
+        q50_model = make_fast_quantile_regressor(Q50_ALPHA, 720 + fold_id, min_samples_leaf=8)
+        q90_model = make_fast_quantile_regressor(Q90_ALPHA, 740 + fold_id, min_samples_leaf=8)
+        q10_model.fit(x_all[train_mask], y_all[train_mask], sample_weight=sample_weight[train_mask])
+        q50_model.fit(x_all[train_mask], y_all[train_mask], sample_weight=sample_weight[train_mask])
+        q90_model.fit(x_all[train_mask], y_all[train_mask], sample_weight=sample_weight[train_mask])
+
+        classifier_weight = np.ones(len(future), dtype=float)
+        classifier_weight[y_near] = 5.0
+        classifier_weight[y_strict] = 20.0
+        near_model = make_fast_hgb_classifier(y_near[train_mask], float(y_near[train_mask].mean()), 760 + fold_id)
+        if not isinstance(near_model, ConstantProbabilityClassifier):
+            near_model.fit(x_all[train_mask], y_near[train_mask], sample_weight=classifier_weight[train_mask])
+        strict_model = make_fast_hgb_classifier(y_strict[train_mask], float(y_strict[train_mask].mean()), 780 + fold_id)
+        if not isinstance(strict_model, ConstantProbabilityClassifier):
+            strict_model.fit(x_all[train_mask], y_strict[train_mask], sample_weight=classifier_weight[train_mask])
+
+        x_hold = x_all[holdout_mask]
+        q_raw = np.column_stack(
+            [
+                np.asarray(q10_model.predict(x_hold), dtype=float),
+                np.asarray(q50_model.predict(x_hold), dtype=float),
+                np.asarray(q90_model.predict(x_hold), dtype=float),
+            ]
+        )
+        q_sorted = np.sort(np.clip(q_raw, 0.0, None), axis=1)
+        q10_pred = q_sorted[:, 0]
+        q50_pred = q_sorted[:, 1]
+        q90_pred = q_sorted[:, 2]
+        near_raw = np.asarray(near_model.predict_proba(x_hold)[:, 1], dtype=float)
+        strict_raw = np.asarray(strict_model.predict_proba(x_hold)[:, 1], dtype=float)
+        near_prob = np.maximum(near_raw, strict_raw)
+        strict_prob = np.minimum(strict_raw, near_prob)
+        hold = future.loc[holdout_mask, ["序列", "时间_s", TARGET_COL]].copy()
+
+        for pos, (_, row) in enumerate(hold.iterrows()):
+            detail_rows.append(
+                {
+                    "留一折次": fold_id,
+                    "留出片段起始序列": seg["start_seq"],
+                    "留出片段结束序列": seg["end_seq"],
+                    "序列": int(row["序列"]),
+                    "真实修正CO": float(row[TARGET_COL]),
+                    "Q10_CO": float(q10_pred[pos]),
+                    "Q50_CO": float(q50_pred[pos]),
+                    "Q90_CO": float(q90_pred[pos]),
+                    "Pr_near_CO_le_3200": float(near_prob[pos]),
+                    "Pr_strict_CO_le_2800": float(strict_prob[pos]),
+                    "Q10是否低于2800": bool(q10_pred[pos] <= EMISSION_STANDARD),
+                    "Q50是否不高于真实CO": bool(q50_pred[pos] <= float(row[TARGET_COL])),
+                    "概率是否嵌套": bool(strict_prob[pos] <= near_prob[pos] + 1e-8),
+                }
+            )
+
+        summary_rows.append(
+            {
+                "留一折次": fold_id,
+                "留出片段起始序列": seg["start_seq"],
+                "留出片段结束序列": seg["end_seq"],
+                "留出样本数": seg["n"],
+                "留出真实CO均值": float(hold[TARGET_COL].mean()),
+                "留出真实CO中位数": float(hold[TARGET_COL].median()),
+                "Q10_CO均值": float(np.mean(q10_pred)),
+                "Q50_CO均值": float(np.mean(q50_pred)),
+                "Q90_CO均值": float(np.mean(q90_pred)),
+                "Q10低于2800比例_%": float(np.mean(q10_pred <= EMISSION_STANDARD) * 100),
+                "Q10低排放潜力指标满足比例_%": float(np.mean(q10_pred <= ROBUST_STANDARD) * 100),
+                "Q50不高于真实CO比例_%": float(np.mean(q50_pred <= hold[TARGET_COL].to_numpy(dtype=float)) * 100),
+                "Q90低于3200比例_%": float(np.mean(q90_pred <= NEAR_STANDARD) * 100),
+                "Pr_near均值": float(np.mean(near_prob)),
+                "Pr_strict均值": float(np.mean(strict_prob)),
+                "概率嵌套违规数": int(np.sum(strict_prob > near_prob + 1e-8)),
+                "验证结论": "留出达标片段可被低分位模型识别" if float(np.mean(q10_pred <= EMISSION_STANDARD)) >= 0.5 else "留出达标片段识别不足，需谨慎解释低排放潜力",
+            }
+        )
+
+    summary = pd.DataFrame(summary_rows)
+    detail = pd.DataFrame(detail_rows)
+    save_csv(summary, DATA_OUT / "达标片段留一验证.csv")
+    save_csv(detail, DATA_OUT / "达标片段留一验证明细.csv")
+    return summary, detail
 
 
 @dataclass
@@ -2061,6 +2551,56 @@ def current_intensity_from_cleaned_sequence(cleaned_by_sequence: pd.DataFrame, s
     return np.array([float(row[f"{i}#风箱负压强度"]) for i in BOX_IDS], dtype=float)
 
 
+def _optional_int(value: object) -> int | None:
+    try:
+        if pd.isna(value):
+            return None
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(number):
+        return None
+    return int(round(number))
+
+
+def _finite_float(value: object, default: float = np.nan) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    return number if np.isfinite(number) else default
+
+
+def observed_co_at_sequence(cleaned: pd.DataFrame, sequence: int | None) -> float:
+    if sequence is None or "序列" not in cleaned.columns or TARGET_COL not in cleaned.columns:
+        return np.nan
+    seq_values = pd.to_numeric(cleaned["序列"], errors="coerce").to_numpy(dtype=float)
+    if len(seq_values) == 0:
+        return np.nan
+    pos = int(np.nanargmin(np.abs(seq_values - sequence)))
+    return _finite_float(cleaned.iloc[pos][TARGET_COL])
+
+
+def control_target_co_context(latest_q2: pd.DataFrame, cleaned: pd.DataFrame) -> dict[str, float | int | None]:
+    row = latest_q2.iloc[0]
+    target_sequence = _optional_int(row.get("序列", np.nan))
+    control_sequence = _optional_int(row.get("控制序列", np.nan))
+    actual_co_t = observed_co_at_sequence(cleaned, control_sequence)
+    if not np.isfinite(actual_co_t):
+        actual_co_t = _finite_float(row.get(f"{CO_HISTORY_PREFIX}lag0", np.nan))
+    actual_co_t300 = _finite_float(row.get(TARGET_COL, np.nan))
+    if not np.isfinite(actual_co_t300):
+        actual_co_t300 = observed_co_at_sequence(cleaned, target_sequence)
+    return {
+        "control_sequence": control_sequence,
+        "target_sequence": target_sequence,
+        "control_time_s": _finite_float(row.get("控制时间_s", np.nan)),
+        "target_time_s": _finite_float(row.get("时间_s", np.nan)),
+        "actual_co_t": actual_co_t,
+        "actual_co_t300": actual_co_t300,
+    }
+
+
 def lagged_intensity_from_row(row: pd.Series, model: LinearCOModel) -> np.ndarray:
     mapping = pressure_feature_map(model)
     return np.array([float(row[mapping[i]]) for i in BOX_IDS], dtype=float)
@@ -2069,6 +2609,12 @@ def lagged_intensity_from_row(row: pd.Series, model: LinearCOModel) -> np.ndarra
 def lagged_temperature_from_row(row: pd.Series, model: LinearCOModel) -> np.ndarray:
     mapping = temperature_feature_map(model)
     return np.array([float(row[mapping[i]]) for i in BOX_IDS], dtype=float)
+
+
+def primary_q50_prediction(control_model: object, frame: pd.DataFrame) -> np.ndarray:
+    if hasattr(control_model, "predict_quantile_dict"):
+        return np.asarray(control_model.predict_quantile_dict(frame)["q50"], dtype=float)
+    return np.asarray(control_model.ridge_predict(frame), dtype=float)
 
 
 def incremental_temperature_for_plan(
@@ -2099,7 +2645,7 @@ def objective_factory(
     base_row = base_frame.iloc[0]
     q2_baseline_temp = lagged_temperature_from_row(base_row, control_model)
     base_control_frame = apply_plan_to_frame(base_frame, np.asarray(base_intensity, dtype=float), q2_baseline_temp, control_model)
-    base_pred = float(control_model.ridge_predict(base_control_frame)[0])
+    base_pred = float(primary_q50_prediction(control_model, base_control_frame)[0])
     diagnostics: dict[str, object] = {
         "evaluated_candidates": 0,
         "max_temperature_clip_count": 0,
@@ -2122,7 +2668,7 @@ def objective_factory(
                 diagnostics["unhandled_q1_features"] = sorted(set(diagnostics["unhandled_q1_features"]) | set(unhandled))
             diagnostics["max_temperature_clip_count"] = max(int(diagnostics["max_temperature_clip_count"]), clipped_count)
             planned = apply_plan_to_frame(base_frame, np.asarray(intensity, dtype=float), temp, control_model)
-            pred = float(control_model.ridge_predict(planned)[0])
+            pred = float(primary_q50_prediction(control_model, planned)[0])
             cache[key] = (pred - base_pred, temp)
             diagnostics["evaluated_candidates"] += 1
         return cache[key][0]
@@ -2160,7 +2706,7 @@ def direct_prediction_factory(
                 diagnostics["unhandled_q1_features"] = sorted(set(diagnostics["unhandled_q1_features"]) | set(unhandled))
             diagnostics["max_temperature_clip_count"] = max(int(diagnostics["max_temperature_clip_count"]), clipped_count)
             planned = apply_plan_to_frame(base_frame, np.asarray(intensity, dtype=float), temp, control_model)
-            pred = float(control_model.ridge_predict(planned)[0])
+            pred = float(primary_q50_prediction(control_model, planned)[0])
             cache[key] = (pred, temp)
             diagnostics["unique_plan_evaluations"] += 1
         return cache[key][0]
@@ -2175,7 +2721,7 @@ def scenario_evaluator_factory(
     speed: float,
     reference_intensity: np.ndarray,
 ) -> tuple[callable, dict[str, object]]:
-    cache: dict[tuple[float, ...], dict[str, object]] = {}
+    cache: dict[tuple[tuple[float, ...], bool], dict[str, object]] = {}
     base_row = base_frame.iloc[0]
     diagnostics: dict[str, object] = {
         "unique_plan_evaluations": 0,
@@ -2183,8 +2729,8 @@ def scenario_evaluator_factory(
         "unhandled_q1_features": [],
     }
 
-    def evaluate(intensity: np.ndarray) -> dict[str, object]:
-        key = tuple(np.round(np.asarray(intensity, dtype=float), 8))
+    def evaluate(intensity: np.ndarray, full_quantiles: bool = True) -> dict[str, object]:
+        key = (tuple(np.round(np.asarray(intensity, dtype=float), 8)), bool(full_quantiles))
         if key not in cache:
             temp, _, _, temp_delta, clipped_count, unhandled = incremental_temperature_for_plan(
                 base_row,
@@ -2198,9 +2744,17 @@ def scenario_evaluator_factory(
                 diagnostics["unhandled_q1_features"] = sorted(set(diagnostics["unhandled_q1_features"]) | set(unhandled))
             diagnostics["max_temperature_clip_count"] = max(int(diagnostics["max_temperature_clip_count"]), clipped_count)
             planned = apply_plan_to_frame(base_frame, np.asarray(intensity, dtype=float), temp, control_model)
-            q10_pred = float(control_model.ridge_predict(planned)[0])
-            q05_pred = float(control_model.predict_low_quantile(planned, Q05_ALPHA)[0]) if hasattr(control_model, "predict_low_quantile") else q10_pred
-            q05_pred = min(q05_pred, q10_pred)
+            if full_quantiles and hasattr(control_model, "predict_quantile_dict"):
+                quantiles = control_model.predict_quantile_dict(planned)
+                q05_pred = float(quantiles["q05"][0])
+                q10_pred = float(quantiles["q10"][0])
+                q50_pred = float(quantiles["q50"][0])
+                q90_pred = float(quantiles["q90"][0])
+            else:
+                q10_pred = float(control_model.ridge_predict(planned)[0])
+                q05_pred = q10_pred
+                q50_pred = q10_pred
+                q90_pred = q10_pred
             if hasattr(control_model, "predict_near_probability"):
                 prob_near = float(control_model.predict_near_probability(planned)[0])
             else:
@@ -2209,13 +2763,39 @@ def scenario_evaluator_factory(
                 prob = float(control_model.predict_standard_probability(planned)[0])
             else:
                 prob = float(np.clip((EMISSION_STANDARD + 400 - q10_pred) / 800, 0.0, 1.0))
+            if hasattr(control_model, "predict_low_layer_probability"):
+                low_layer_prob = float(control_model.predict_low_layer_probability(planned)[0])
+            else:
+                low_layer_prob = np.nan
+            if hasattr(control_model, "tail_alpha"):
+                tail_alpha = float(control_model.tail_alpha(planned)[0])
+            else:
+                tail_alpha = np.nan
+            if hasattr(control_model, "template_distance"):
+                template_distance_value = float(control_model.template_distance(planned)[0])
+            else:
+                template_distance_value = np.nan
+            if hasattr(control_model, "assign_regime"):
+                regime_id = int(control_model.assign_regime(planned)[0])
+                layer_names = regime_name_map_for_template_layers()
+                regime_name = layer_names.get(regime_id, str(regime_id))
+            else:
+                regime_id = -1
+                regime_name = ""
             cache[key] = {
-                "pred_co": q10_pred,
+                "pred_co": q50_pred,
                 "q10_co": q10_pred,
                 "q05_co": q05_pred,
+                "q50_co": q50_pred,
+                "q90_co": q90_pred,
                 "near_probability": prob_near,
                 "strict_probability": prob,
                 "standard_probability": prob,
+                "low_layer_probability": low_layer_prob,
+                "tail_alpha": tail_alpha,
+                "template_distance": template_distance_value,
+                "regime_id": regime_id,
+                "regime_name": regime_name,
                 "temperature": temp,
                 "temperature_delta": temp_delta,
             }
@@ -2267,6 +2847,107 @@ def pressure_smoothness(x: np.ndarray, reference: np.ndarray, widths: np.ndarray
     reference = np.asarray(reference, dtype=float)
     scale = np.maximum((widths[:-1] + widths[1:]) / 2.0, 1e-6)
     return float(np.mean(np.abs(np.diff(x) - np.diff(reference)) / scale))
+
+
+def temperature_history_bounds(cleaned: pd.DataFrame, low_q: float = 0.05, high_q: float = 0.95) -> tuple[np.ndarray, np.ndarray]:
+    cache_key = (id(cleaned), float(low_q), float(high_q))
+    if cache_key in _TEMP_BOUNDS_CACHE:
+        return _TEMP_BOUNDS_CACHE[cache_key]
+    lows: list[float] = []
+    highs: list[float] = []
+    for i in BOX_IDS:
+        col = f"{i}#风箱平均温度"
+        if col in cleaned.columns:
+            s = pd.to_numeric(cleaned[col], errors="coerce").dropna()
+            lows.append(float(s.quantile(low_q)) if not s.empty else -np.inf)
+            highs.append(float(s.quantile(high_q)) if not s.empty else np.inf)
+        else:
+            lows.append(-np.inf)
+            highs.append(np.inf)
+    result = (np.asarray(lows, dtype=float), np.asarray(highs, dtype=float))
+    _TEMP_BOUNDS_CACHE[cache_key] = result
+    return result
+
+
+def engineering_feasibility_metrics(
+    intensity: np.ndarray,
+    base_intensity: np.ndarray,
+    ranges: pd.DataFrame,
+    constraints: dict[str, object] | None,
+    temp_delta: np.ndarray | None = None,
+    scenario_temp: np.ndarray | None = None,
+    cleaned: pd.DataFrame | None = None,
+) -> dict[str, object]:
+    x = np.asarray(intensity, dtype=float)
+    base = np.asarray(base_intensity, dtype=float)
+    p05 = ranges["扩展强度下限_P05"].to_numpy(dtype=float)
+    p95 = ranges["扩展强度上限_P95"].to_numpy(dtype=float)
+    historical_range_ok = bool(np.all((x >= p05 - 1e-8) & (x <= p95 + 1e-8)))
+    pressure_boundary_count = int(np.sum((x < p05 - 1e-8) | (x > p95 + 1e-8)))
+
+    if constraints is not None:
+        lows, highs, _, adjacent_limits, total_budget = constrained_bounds_and_limits(ranges, constraints, base)
+        min_adjust = float(constraints.get("min_adjust", 0.0))
+        pressure_violation = max_constraint_violation(x, base, lows, highs, adjacent_limits, total_budget)
+        strict_pressure_ok = is_feasible_plan(x, base, lows, highs, adjacent_limits, total_budget, eps=1e-6)
+    else:
+        lows, highs = p05, p95
+        adjacent_limits = np.full(len(BOX_IDS) - 1, np.inf, dtype=float)
+        total_budget = float(np.sum(np.abs(x - base)))
+        min_adjust = 0.0
+        pressure_violation = 0.0 if historical_range_ok else float(max(np.max(p05 - x), np.max(x - p95), 0.0))
+        strict_pressure_ok = historical_range_ok
+
+    total_adjustment = float(np.sum(np.abs(x - base)))
+    max_single_adjustment = float(np.max(np.abs(x - base)))
+    adjacent_diffs = np.abs(np.diff(x))
+    max_adjacent_diff = float(np.max(adjacent_diffs)) if len(adjacent_diffs) else 0.0
+    smooth_violation_values = np.maximum(adjacent_diffs - adjacent_limits, 0.0) if len(adjacent_diffs) else np.asarray([], dtype=float)
+    smooth_violation = float(np.max(smooth_violation_values)) if len(smooth_violation_values) else 0.0
+
+    if temp_delta is None:
+        temp_delta_arr = np.zeros(len(BOX_IDS), dtype=float)
+    else:
+        temp_delta_arr = np.asarray(temp_delta, dtype=float)
+    max_temp_delta = float(np.nanmax(np.abs(temp_delta_arr))) if temp_delta_arr.size else 0.0
+    temp_delta_ok = bool(np.all(np.abs(temp_delta_arr) <= ENGINEERING_TEMP_DELTA_LIMIT + 1e-8))
+    temp_delta_violation = float(np.nansum(np.maximum(np.abs(temp_delta_arr) - ENGINEERING_TEMP_DELTA_LIMIT, 0.0)))
+
+    temp_out_p05_p95 = 0
+    temp_out_p01_p99 = 0
+    if cleaned is not None and scenario_temp is not None:
+        scenario_temp_arr = np.asarray(scenario_temp, dtype=float)
+        t05, t95 = temperature_history_bounds(cleaned, 0.05, 0.95)
+        t01, t99 = temperature_history_bounds(cleaned, 0.01, 0.99)
+        temp_out_p05_p95 = int(np.sum((scenario_temp_arr < t05 - 1e-8) | (scenario_temp_arr > t95 + 1e-8)))
+        temp_out_p01_p99 = int(np.sum((scenario_temp_arr < t01 - 1e-8) | (scenario_temp_arr > t99 + 1e-8)))
+
+    normalized_adjust = total_adjustment / max(float(total_budget), 1e-6)
+    normalized_temp_violation = temp_delta_violation / max(ENGINEERING_TEMP_DELTA_LIMIT * len(BOX_IDS), 1e-6)
+    normalized_smooth_violation = float(np.sum(smooth_violation_values) / max(np.sum(adjacent_limits[np.isfinite(adjacent_limits)]), 1e-6)) if len(smooth_violation_values) else 0.0
+    boundary_violation = (pressure_boundary_count + temp_out_p05_p95) / max(2 * len(BOX_IDS), 1)
+    feasibility = float(np.clip(1.0 - normalized_adjust - normalized_temp_violation - normalized_smooth_violation - boundary_violation, 0.0, 1.0))
+    strict_ok = bool(strict_pressure_ok and temp_delta_ok)
+
+    return {
+        "总调节量": total_adjustment,
+        "最大单箱调节量": max_single_adjustment,
+        "相邻风箱最大差值": max_adjacent_diff,
+        "最大温度增量": max_temp_delta,
+        "温度越界数量_P05_P95": temp_out_p05_p95,
+        "温度越界数量_P01_P99": temp_out_p01_p99,
+        "负压历史P05_P95越界数量": pressure_boundary_count,
+        "压力约束最大违规量": float(pressure_violation),
+        "相邻平滑最大违规量": smooth_violation,
+        "是否满足严格工程约束": strict_ok,
+        "工程可实施性评分": feasibility,
+        "标准化调节量_相对预算": float(normalized_adjust),
+        "最小总调节量约束": float(min_adjust),
+        "是否满足最小总调节量": bool(total_adjustment >= min_adjust - 1e-8),
+        "温度增量是否可行": temp_delta_ok,
+        "负压硬约束是否可行": bool(strict_pressure_ok),
+        "负压历史P05_P95是否可行_诊断": historical_range_ok,
+    }
 
 
 def low_emission_seed_points(
@@ -2338,7 +3019,7 @@ def make_historical_compliant_profile(cleaned: pd.DataFrame, latest_actual: np.n
         rows.append(
             {
                 "风箱编号": i,
-                "统计样本": "第二问修正CO<=2800且非异常孤立点" if not compliant.empty else "全历史样本_无可信达标样本兜底",
+                "统计样本": "原始单点CO<=2800_低CO不剔除" if not compliant.empty else "全历史样本_无单点达标样本兜底",
                 "达标样本数": int(len(compliant)),
                 "全样本数": int(len(cleaned)),
                 "达标样本比例_%": float(len(compliant) / len(cleaned) * 100),
@@ -2360,7 +3041,9 @@ def make_historical_compliant_profile(cleaned: pd.DataFrame, latest_actual: np.n
             {
                 "全样本数": int(len(cleaned)),
                 "历史达标样本数": int(len(compliant)),
-                "修正后CO小于等于2800样本数": int((cleaned[TARGET_COL] <= EMISSION_STANDARD).sum()),
+                "原始CO小于等于2800样本数_不剔除": int((cleaned[TARGET_COL] <= EMISSION_STANDARD).sum()),
+                "修正后CO小于等于2800样本数": int((cleaned[Q2_CORRECTED_CO_COL] <= EMISSION_STANDARD).sum()) if Q2_CORRECTED_CO_COL in cleaned.columns else np.nan,
+                "严格可信达标样本数_原异常剔除口径": int(bool_series(cleaned[STRICT_TRUSTED_STANDARD_COL]).sum()) if STRICT_TRUSTED_STANDARD_COL in cleaned.columns else np.nan,
                 "历史达标比例_%": float(len(compliant) / len(cleaned) * 100),
                 "达标样本CO均值": float(compliant[TARGET_COL].mean()) if not compliant.empty else np.nan,
                 "达标样本CO中位数": float(compliant[TARGET_COL].median()) if not compliant.empty else np.nan,
@@ -2499,6 +3182,10 @@ def make_importance_group_summary(importance: pd.DataFrame) -> pd.DataFrame:
         grouped["置换RMSE增量"] = pd.to_numeric(grouped["置换RMSE增量"], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
     def group_feature(name: str) -> str:
+        if name.startswith(CO_HISTORY_PREFIX) or "CO状态" in name or "历史浓度" in name:
+            return "CO状态变量"
+        if "调节量" in name:
+            return "负压调节量特征"
         if "大烟道温度" in name:
             return "大烟道温度"
         if "大烟道负压" in name:
@@ -2541,6 +3228,9 @@ def optimize_global_standard_model(
     model_co_weight: float,
     template_weight: float,
     seed_points: list[np.ndarray] | None = None,
+    constraints: dict[str, object] | None = None,
+    cleaned: pd.DataFrame | None = None,
+    strict_probability_constraint_enabled: bool = True,
 ) -> tuple[np.ndarray, float, np.ndarray, float, pd.DataFrame, dict[str, object]]:
     lows, highs = main_allowed_bounds(ranges)
     lows = np.minimum(lows, np.asarray(latest_actual, dtype=float))
@@ -2560,72 +3250,206 @@ def optimize_global_standard_model(
     ]
     if seed_points:
         starts_raw.extend([np.clip(np.asarray(seed, dtype=float), lows, highs) for seed in seed_points[:6]])
+    min_adjust = float((constraints or {}).get("min_adjust", SCHEME_B_MIN_ADJUST))
+    current_start = np.clip(latest_actual, lows, highs)
+    if constraints is not None:
+        eng_lows, eng_highs, _, eng_adjacent_limits, eng_total_budget = constrained_bounds_and_limits(ranges, constraints, latest_actual)
+        engineering_targets = [
+            np.asarray(historical_profile, dtype=float),
+            hist_low,
+            hist_median,
+            hist_high,
+        ]
+        if seed_points:
+            engineering_targets.extend([np.asarray(seed, dtype=float) for seed in seed_points[:6]])
+        for target in engineering_targets:
+            direction = np.clip(target, eng_lows, eng_highs) - latest_actual
+            direction_l1 = float(np.sum(np.abs(direction)))
+            if direction_l1 <= 1e-9:
+                continue
+            if direction_l1 > eng_total_budget:
+                direction = direction * (eng_total_budget / direction_l1)
+            for frac in (0.25, 0.50, 0.75, 1.00):
+                trial = latest_actual + frac * direction
+                trial = feasible_initial_point(trial, latest_actual, eng_lows, eng_highs, eng_adjacent_limits, eng_total_budget)
+                if float(np.sum(np.abs(trial - latest_actual))) >= max(min_adjust * 0.5, 1e-8):
+                    starts_raw.append(np.clip(trial, lows, highs))
+        rear_boost = np.array(
+            [0.10, -0.10, -0.02, -0.04, -0.04, 0.07, 0.07, 0.07, 0.07, 0.07, 0.07, 0.07, 0.07, 0.06, 0.06, 0.60, 0.24, 0.48],
+            dtype=float,
+        )
+        smooth_ramp = np.linspace(-0.08, 0.55, len(BOX_IDS))
+        for pattern in (rear_boost, smooth_ramp, -smooth_ramp):
+            for scale in (0.50, 1.00):
+                trial = latest_actual + scale * pattern
+                trial = feasible_initial_point(trial, latest_actual, eng_lows, eng_highs, eng_adjacent_limits, eng_total_budget)
+                if float(np.sum(np.abs(trial - latest_actual))) >= max(min_adjust * 0.5, 1e-8):
+                    starts_raw.append(np.clip(trial, lows, highs))
+    for idx in np.argsort(widths)[::-1][:4]:
+        for direction in (-1.0, 1.0):
+            trial = current_start.copy()
+            available = highs[idx] - trial[idx] if direction > 0 else trial[idx] - lows[idx]
+            step = min(max(min_adjust, 0.05), max(float(available), 0.0))
+            if step > 1e-8:
+                trial[idx] += direction * step
+                starts_raw.append(np.clip(trial, lows, highs))
     starts_raw.append(center)
     starts: list[np.ndarray] = []
     for start in starts_raw:
         key = tuple(np.round(start, 6))
         if not any(tuple(np.round(item, 6)) == key for item in starts):
             starts.append(start)
-    starts = starts[:6]
+    starts = starts[:36]
     search_rows: list[dict[str, object]] = []
+    base_scenario = evaluate_plan(np.asarray(latest_actual, dtype=float))
+    base_q10 = float(base_scenario.get("q10_co", base_scenario["pred_co"]))
+    base_q50 = float(base_scenario.get("q50_co", base_q10))
+    base_q90 = float(base_scenario.get("q90_co", base_q50))
+    base_near_prob = float(base_scenario.get("near_probability", np.nan))
+    base_strict_prob = float(base_scenario.get("strict_probability", base_scenario.get("standard_probability", np.nan)))
+    base_low_layer_prob = float(base_scenario.get("low_layer_probability", np.nan))
+    base_regime_id = int(base_scenario.get("regime_id", 2))
+    base_template_distance = float(base_scenario.get("template_distance", np.nan))
+    if (
+        base_regime_id == 0
+        or (np.isfinite(base_low_layer_prob) and base_low_layer_prob >= STRICT_PROB_SOFT_MIN)
+        or (
+            np.isfinite(base_strict_prob)
+            and np.isfinite(base_near_prob)
+            and base_strict_prob >= STRICT_PROB_SOFT_MIN
+            and base_near_prob >= NEAR_PROB_SOFT_MIN
+        )
+    ):
+        condition_gate = "接近达标工况层"
+        q50_claim_allowed = True
+    elif base_regime_id == 1 or (np.isfinite(base_low_layer_prob) and base_low_layer_prob >= 0.20) or (np.isfinite(base_near_prob) and base_near_prob >= 0.50):
+        condition_gate = "达标工况过渡层"
+        q50_claim_allowed = False
+    else:
+        condition_gate = "远离达标工况层"
+        q50_claim_allowed = False
 
-    def score_components(x: np.ndarray, target_quantile: str) -> dict[str, float]:
-        scenario = evaluate_plan(np.asarray(x, dtype=float))
+    def score_components(x: np.ndarray, target_quantile: str, full_quantiles: bool = True) -> dict[str, float]:
+        try:
+            scenario = evaluate_plan(np.asarray(x, dtype=float), full_quantiles)
+        except TypeError:
+            scenario = evaluate_plan(np.asarray(x, dtype=float))
         q10 = float(scenario.get("q10_co", scenario["pred_co"]))
         q05 = float(scenario.get("q05_co", q10))
         q05 = min(q05, q10)
-        pred = q05 if target_quantile == "Q05" else q10
+        q50 = float(scenario.get("q50_co", q10))
+        q90 = float(scenario.get("q90_co", q50))
+        pred = q50 if target_quantile == "Q50" else (q05 if target_quantile == "Q05" else q10)
         near_prob = float(scenario.get("near_probability", np.nan))
         prob = float(scenario.get("strict_probability", scenario.get("standard_probability", np.nan)))
-        hist_penalty = interval_distance(x, hist_low, hist_high, widths)
+        pressure_template_penalty = interval_distance(x, hist_low, hist_high, widths)
+        condition_template_penalty = float(scenario.get("template_distance", np.nan))
+        hist_penalty = condition_template_penalty if np.isfinite(condition_template_penalty) else pressure_template_penalty
         boundary_penalty = boundary_pressure_penalty(x, lows, highs)
         adjust_penalty = normalized_adjustment(x, latest_actual, lows, highs) / len(BOX_IDS)
         smooth_penalty = pressure_smoothness(x, latest_actual, widths)
-        temp_penalty = temperature_violation_score(np.asarray(scenario.get("temperature_delta", np.zeros(len(BOX_IDS))), dtype=float), mode="theory")
-        gap = max(0.0, (pred - EMISSION_STANDARD) / 500.0)
-        near_shortfall = max(0.45 - near_prob, 0.0) if np.isfinite(near_prob) else 0.0
+        temp_delta = np.asarray(scenario.get("temperature_delta", np.zeros(len(BOX_IDS))), dtype=float)
+        scenario_temp = np.asarray(scenario.get("temperature", np.full(len(BOX_IDS), np.nan)), dtype=float)
+        temp_penalty = temperature_violation_score(temp_delta, mode="theory")
+        feasibility = engineering_feasibility_metrics(x, latest_actual, ranges, constraints, temp_delta, scenario_temp, cleaned)
+        q50_constraint_gap = max(0.0, (q50 - Q50_DESIRED_STANDARD) / 500.0)
+        q10_potential_gap = max(0.0, (q10 - Q10_CONSTRAINT_STANDARD) / 500.0)
+        q50_increase = max(0.0, (q50 - base_q50) / 500.0)
+        q90_increase = max(0.0, (q90 - base_q90) / 500.0)
+        q90_risk = max(0.0, (q90 - NEAR_STANDARD) / 500.0)
+        strict_shortfall = max(PLANNING_PROBABILITY_THRESHOLD - prob, 0.0) if np.isfinite(prob) else PLANNING_PROBABILITY_THRESHOLD
+        strict_median_shortfall = max(STRICT_PROB_MEDIAN_TARGET - prob, 0.0) if np.isfinite(prob) else STRICT_PROB_MEDIAN_TARGET
+        near_shortfall = max(NEAR_PROB_SOFT_MIN - near_prob, 0.0) if np.isfinite(near_prob) else NEAR_PROB_SOFT_MIN
+        q50_worse_gap = max(0.0, (q50 - base_q50) / 500.0)
         score = (
-            1000.0 * gap * gap
-            + pred / 500.0
+            q50 / 500.0
+            + 1200.0 * q50_constraint_gap * q50_constraint_gap
+            + 900.0 * q90_increase * q90_increase
+            + 1500.0 * q50_worse_gap * q50_worse_gap
+            + 35.0 * q50_increase * q50_increase
+            + 8.0 * q90_risk * q90_risk
+            + 20.0 * q10_potential_gap * q10_potential_gap
             + 18.0 * temp_penalty
             + 2.0 * smooth_penalty
             + 0.9 * adjust_penalty
             + template_weight * hist_penalty
             + 0.45 * boundary_penalty
-            + probability_weight * near_shortfall * near_shortfall
+            + (probability_weight * near_shortfall * near_shortfall if strict_probability_constraint_enabled else 0.0)
+            + (2.5 * probability_weight * strict_shortfall * strict_shortfall if strict_probability_constraint_enabled else 0.0)
+            + (0.5 * probability_weight * strict_median_shortfall * strict_median_shortfall if strict_probability_constraint_enabled else 0.0)
         )
-        return {
+        out = {
             "低排放目标评分": float(score),
+            "目标分位": target_quantile,
             "目标低分位": target_quantile,
             "目标低分位CO_mg_m3": pred,
-            "模型预测CO_mg_m3": pred,
+            "模型预测CO_mg_m3": q50,
             "Q10_CO_low_final": q10,
             "Q05_CO_low_extreme": q05,
+            "Q50_CO": q50,
+            "Q90_CO": q90,
+            "ΔQ10": q10 - base_q10,
+            "ΔQ50": q50 - base_q50,
+            "ΔQ90": q90 - base_q90,
             "近达标概率Pr_CO_le_3200": near_prob,
             "严格达标概率Pr_CO_le_2800": prob,
             "达标倾向概率": prob,
-            "历史达标IQR距离": hist_penalty,
-            "达标缺口gap": float(gap),
+            "低排放工况层概率Pr_low": float(scenario.get("low_layer_probability", np.nan)),
+            "Q50尾部融合alpha": float(scenario.get("tail_alpha", np.nan)),
+            "所属工况层": int(scenario.get("regime_id", -1)),
+            "所属工况层名称": str(scenario.get("regime_name", "")),
+            "历史达标IQR距离": pressure_template_penalty,
+            "整体工况达标模板距离": hist_penalty,
+            "达标缺口gap": float(q50_constraint_gap),
+            "规划约束_Q50是否低于2800": bool(q50 <= Q50_DESIRED_STANDARD),
+            "规划约束_Q90是否不高于基准": bool(q90 <= base_q90 + 1e-8),
+            "规划约束_概率阈值θ": float(PLANNING_PROBABILITY_THRESHOLD),
+            "规划约束_Pr是否达标": bool(np.isfinite(prob) and prob >= PLANNING_PROBABILITY_THRESHOLD),
+            "Q10低排放潜力缺口gap": float(q10_potential_gap),
+            "Q10低排放潜力余量_mg_m3": float(Q10_CONSTRAINT_STANDARD - q10),
+            "是否满足Q10低排放潜力指标": bool(q10 <= Q10_CONSTRAINT_STANDARD),
+            "稳健达标缺口gap": float(q10_potential_gap),
+            "稳健达标余量_mg_m3": float(EMISSION_STANDARD - q10),
+            "是否满足稳健达标余量": bool(q10 <= Q10_CONSTRAINT_STANDARD),
+            "Q10约束是否满足": bool(q10 <= Q10_CONSTRAINT_STANDARD),
+            "Q50是否低于2800": bool(q50 <= Q50_DESIRED_STANDARD),
+            "Q50是否不劣于基准": bool(q50 <= base_q50 + 1e-8),
+            "Q50较基准是否不升高": bool(q50 <= base_q50 + 1e-8),
+            "Q90较基准是否不升高": bool(q90 <= base_q90 + 1e-8),
+            "Q90是否高风险": bool(q90 > NEAR_STANDARD or q90 > base_q90 + 1e-8),
+            "Q50升高惩罚": float(q50_increase),
+            "Q90升高惩罚": float(q90_increase),
+            "Q90风险惩罚": float(q90_risk),
             "温度宽约束违规": temp_penalty,
             "负压平滑惩罚": smooth_penalty,
+            "Pr_strict柔性约束缺口": float(strict_shortfall),
+            "Pr_strict中位约束缺口": float(strict_median_shortfall),
+            "Pr_strict柔性约束是否满足": bool(np.isfinite(prob) and prob >= PLANNING_PROBABILITY_THRESHOLD),
+            "Pr_strict中位约束是否满足": bool(np.isfinite(prob) and prob >= STRICT_PROB_MEDIAN_TARGET),
+            "Pr_near柔性约束是否满足": bool(np.isfinite(near_prob) and near_prob >= NEAR_PROB_SOFT_MIN),
+            "Pr_strict优化约束启用": bool(strict_probability_constraint_enabled),
             "近达标概率引导不足": float(near_shortfall),
             "边界惩罚": boundary_penalty,
             "当前工况标准化调节量": normalized_adjustment(x, latest_actual, lows, highs),
+            "方案B最小总调节量": min_adjust,
+            "是否满足方案B最小调节量": bool(float(feasibility["总调节量"]) >= min_adjust - 1e-8),
             "CO模型项权重": model_co_weight,
             "达标概率项权重": probability_weight,
             "可信达标模板距离权重": template_weight,
         }
+        out.update(feasibility)
+        return out
 
     candidates: list[tuple[float, np.ndarray, dict[str, float]]] = []
 
-    for target_quantile in ["Q10", "Q05"]:
-        for start_id, start in enumerate(starts, start=1):
+    for target_quantile in ["Q50"]:
+        for start_id, start in enumerate(starts[:MAIN_POWELL_MAX_STARTS], start=1):
             result = minimize(
-                lambda x, tq=target_quantile: score_components(np.clip(np.asarray(x, dtype=float), lows, highs), tq)["低排放目标评分"],
+                lambda x, tq=target_quantile: score_components(np.clip(np.asarray(x, dtype=float), lows, highs), tq, full_quantiles=False)["低排放目标评分"],
                 np.asarray(start, dtype=float),
                 method="Powell",
                 bounds=bounds,
-                options={"maxiter": 8, "xtol": 1e-4, "ftol": 1e-5, "disp": False},
+                options={"maxiter": MAIN_POWELL_MAXITER, "xtol": 1e-4, "ftol": 1e-5, "disp": False},
             )
             x = np.clip(np.asarray(result.x if result.x is not None else start, dtype=float), lows, highs)
             comp = score_components(x, target_quantile)
@@ -2660,39 +3484,147 @@ def optimize_global_standard_model(
     if not candidates:
         raise RuntimeError("主模型未找到允许范围内的负压组合")
 
-    q10_candidates = [item for item in candidates if item[2]["目标低分位"] == "Q10"]
-    q05_candidates = [item for item in candidates if item[2]["目标低分位"] == "Q05"]
+    q50_candidates = [item for item in candidates if item[2]["目标分位"] == "Q50"]
 
-    def priority_key(item: tuple[float, np.ndarray, dict[str, float]]) -> tuple[float, float, float, float, float, float]:
+    def priority_key(item: tuple[float, np.ndarray, dict[str, float]]) -> tuple[float, ...]:
         comp = item[2]
+        prob_gap = float(comp["Pr_strict柔性约束缺口"]) if strict_probability_constraint_enabled else 0.0
+        near_gap = float(comp["近达标概率引导不足"]) if strict_probability_constraint_enabled else 0.0
         return (
             float(comp["达标缺口gap"]),
-            float(comp["目标低分位CO_mg_m3"]),
+            prob_gap,
+            near_gap,
+            float(comp["Q50_CO"]),
+            max(0.0, float(comp["Q90升高惩罚"])),
+            max(0.0, float(comp["达标缺口gap"])),
+            max(0.0, float(comp["ΔQ50"])),
             float(comp["温度宽约束违规"]),
             float(comp["负压平滑惩罚"]),
-            float(comp["当前工况标准化调节量"]),
-            float(comp["历史达标IQR距离"]),
+            float(comp["总调节量"]),
+            float(comp["整体工况达标模板距离"]),
         )
 
-    best_q10 = min(q10_candidates, key=priority_key)
-    if float(best_q10[2]["Q10_CO_low_final"]) <= EMISSION_STANDARD:
-        scheme_a = best_q10
-        scheme_a_note = "Q10预测已低于2800，作为理论达标优先方案"
+    def q50_optimal_key(item: tuple[float, np.ndarray, dict[str, float]]) -> tuple[float, ...]:
+        comp = item[2]
+        prob_gap = float(comp["Pr_strict柔性约束缺口"]) if strict_probability_constraint_enabled else 0.0
+        near_gap = float(comp["近达标概率引导不足"]) if strict_probability_constraint_enabled else 0.0
+        return (
+            float(comp["Q50_CO"]),
+            float(comp["达标缺口gap"]),
+            prob_gap,
+            near_gap,
+            max(0.0, float(comp["Q90升高惩罚"])),
+            float(comp["温度宽约束违规"]),
+            float(comp["负压平滑惩罚"]),
+            float(comp["总调节量"]),
+            float(comp["整体工况达标模板距离"]),
+        )
+
+    def q90_risk_key(item: tuple[float, np.ndarray, dict[str, float]]) -> tuple[float, ...]:
+        comp = item[2]
+        prob_gap = float(comp["Pr_strict柔性约束缺口"]) if strict_probability_constraint_enabled else 0.0
+        near_gap = float(comp["近达标概率引导不足"]) if strict_probability_constraint_enabled else 0.0
+        return (
+            float(comp["Q90_CO"]),
+            max(0.0, float(comp["ΔQ90"])),
+            float(comp["达标缺口gap"]),
+            prob_gap,
+            near_gap,
+            float(comp["Q50_CO"]),
+            float(comp["温度宽约束违规"]),
+            float(comp["负压平滑惩罚"]),
+            float(comp["总调节量"]),
+        )
+
+    def distinct_from(
+        pool: list[tuple[float, np.ndarray, dict[str, float]]],
+        reference: tuple[float, np.ndarray, dict[str, float]],
+        min_distance: float,
+    ) -> list[tuple[float, np.ndarray, dict[str, float]]]:
+        distinct = [item for item in pool if float(np.sum(np.abs(item[1] - reference[1]))) >= min_distance]
+        return distinct if distinct else pool
+
+    engineering_q50_candidates = [item for item in q50_candidates if bool(item[2].get("是否满足严格工程约束", False))]
+    engineering_nonworse_candidates = [item for item in engineering_q50_candidates if bool(item[2].get("Q50是否不劣于基准", False))]
+    scheme_a_pool = engineering_nonworse_candidates if engineering_nonworse_candidates else engineering_q50_candidates
+    if not scheme_a_pool:
+        scheme_a_pool = q50_candidates
+    scheme_a = min(scheme_a_pool, key=q50_optimal_key)
+    if q50_claim_allowed and bool(scheme_a[2].get("Q50是否低于2800", False)):
+        scheme_a_note = "方案A按Q50最小化选择；Q50规划约束满足，Q10仅作为低排放潜力指标复核"
+    elif q50_claim_allowed:
+        scheme_a_note = "方案A按Q50最小化选择；Q50规划约束仍有缺口，Q10仅作为低排放潜力指标"
+    elif not bool(scheme_a[2].get("是否满足严格工程约束", False)):
+        scheme_a_note = f"未找到严格工程可行候选；当前状态为{condition_gate}，仅保留诊断方向，不作为执行方案"
     else:
-        scheme_a = min(q05_candidates, key=priority_key)
-        scheme_a_note = "Q10未压到2800，改用Q05作为理论低排放极限方案"
-    scheme_b = min(q10_candidates, key=lambda item: item[0])
+        scheme_a_note = f"方案A为Q50最低的候选；当前状态为{condition_gate}，不承诺现场达标"
+
+    nonzero_q50_candidates = [item for item in q50_candidates if bool(item[2].get("是否满足方案B最小调节量", False))]
+    strict_engineering_candidates = [
+        item
+        for item in nonzero_q50_candidates
+        if bool(item[2].get("是否满足严格工程约束", False)) and bool(item[2].get("Q50是否不劣于基准", False))
+    ]
+    prob_feasible_candidates = [
+        item
+        for item in strict_engineering_candidates
+        if (
+            not strict_probability_constraint_enabled
+            or (bool(item[2].get("Pr_strict柔性约束是否满足", False)) and bool(item[2].get("Pr_near柔性约束是否满足", False)))
+        )
+    ]
+    q50_feasible_candidates = [item for item in prob_feasible_candidates if bool(item[2].get("Q50是否低于2800", False))]
+    q90_feasible_candidates = [item for item in q50_feasible_candidates if bool(item[2].get("Q90较基准是否不升高", False))]
+    risk_engineering_candidates = [
+        item
+        for item in nonzero_q50_candidates
+        if bool(item[2].get("是否满足严格工程约束", False)) and bool(item[2].get("Q50是否低于2800", False))
+    ]
+    risk_prob_candidates = [
+        item
+        for item in risk_engineering_candidates
+        if (
+            not strict_probability_constraint_enabled
+            or (bool(item[2].get("Pr_strict柔性约束是否满足", False)) and bool(item[2].get("Pr_near柔性约束是否满足", False)))
+        )
+    ]
+    risk_q50_candidates = [item for item in risk_prob_candidates if bool(item[2].get("Q50是否低于2800", False))]
+    risk_q90_candidates = [item for item in risk_q50_candidates if bool(item[2].get("Q90较基准是否不升高", False))]
+    if risk_q90_candidates:
+        scheme_b_pool = distinct_from(risk_q90_candidates, scheme_a, max(0.05, min_adjust * 0.10))
+        scheme_b = min(scheme_b_pool, key=q90_risk_key)
+        scheme_b_note = "方案B按Q90风险最低选择；同时满足Q50≤2800、Q90≤基准Q90和概率阈值检查"
+    elif risk_q50_candidates:
+        scheme_b_pool = distinct_from(risk_q50_candidates, scheme_a, max(0.05, min_adjust * 0.10))
+        scheme_b = min(scheme_b_pool, key=q90_risk_key)
+        scheme_b_note = "方案B优先降低Q90风险，已满足Q50≤2800，但Q90或概率约束仍需复核"
+    elif risk_prob_candidates:
+        scheme_b_pool = distinct_from(risk_prob_candidates, scheme_a, max(0.05, min_adjust * 0.10))
+        scheme_b = min(scheme_b_pool, key=q90_risk_key)
+        scheme_b_note = "方案B优先降低Q90风险，概率约束可接受，但Q50≤2800仍有缺口"
+    elif risk_engineering_candidates:
+        scheme_b_pool = distinct_from(risk_engineering_candidates, scheme_a, max(0.05, min_adjust * 0.10))
+        scheme_b = min(scheme_b_pool, key=q90_risk_key)
+        scheme_b_note = "方案B在严格工程可行且Q50不劣于基准的候选中选择Q90较低者"
+    elif nonzero_q50_candidates:
+        scheme_b_pool = distinct_from(nonzero_q50_candidates, scheme_a, max(0.05, min_adjust * 0.10))
+        scheme_b = min(scheme_b_pool, key=q90_risk_key)
+        scheme_b_note = "未找到严格工程可行的风险候选，方案B仅保留Q90相对较低的诊断方向"
+    else:
+        scheme_b_pool = distinct_from(q50_candidates, scheme_a, max(0.05, min_adjust * 0.10))
+        scheme_b = min(scheme_b_pool, key=q90_risk_key)
+        scheme_b_note = "未找到非零调节风险候选；方案B仅作Q90风险诊断，不作为执行方案"
 
     final_plan = scheme_a[1].copy()
     final_comp = scheme_a[2]
     final_co = float(final_comp["目标低分位CO_mg_m3"])
     min_plan = scheme_b[1].copy()
-    min_co = float(scheme_b[2]["Q10_CO_low_final"])
+    min_co = float(scheme_b[2]["Q50_CO"])
 
     search_df = pd.DataFrame(search_rows)
     save_csv(search_df, DATA_MID / "主模型_全局达标优化搜索记录.csv")
     save_csv(search_df, DATA_MID / "主模型_非线性低排放优化搜索记录.csv")
-    save_csv(search_df, DATA_OUT / "主模型_Q10_Q05达标潜力优化搜索记录.csv")
+    save_csv(search_df, DATA_OUT / "主模型_Q50_Q90_概率三层规划搜索记录.csv")
 
     def scheme_payload(name: str, item: tuple[float, np.ndarray, dict[str, float]], note: str) -> dict[str, object]:
         comp = item[2]
@@ -2701,45 +3633,106 @@ def optimize_global_standard_model(
             "说明": note,
             "目标低分位": comp["目标低分位"],
             "目标低分位CO_mg_m3": float(comp["目标低分位CO_mg_m3"]),
+            "目标分位": comp["目标分位"],
             "Q10_CO_low_final": float(comp["Q10_CO_low_final"]),
             "Q05_CO_low_extreme": float(comp["Q05_CO_low_extreme"]),
+            "Q50_CO": float(comp["Q50_CO"]),
+            "Q90_CO": float(comp["Q90_CO"]),
+            "ΔQ10": float(comp["ΔQ10"]),
+            "ΔQ50": float(comp["ΔQ50"]),
+            "ΔQ90": float(comp["ΔQ90"]),
             "近达标概率Pr_CO_le_3200": float(comp["近达标概率Pr_CO_le_3200"]),
             "严格达标概率Pr_CO_le_2800": float(comp["严格达标概率Pr_CO_le_2800"]),
             "达标缺口gap": float(comp["达标缺口gap"]),
+            "规划约束_Q50是否低于2800": bool(comp["规划约束_Q50是否低于2800"]),
+            "规划约束_Q90是否不高于基准": bool(comp["规划约束_Q90是否不高于基准"]),
+            "规划约束_概率阈值θ": float(comp["规划约束_概率阈值θ"]),
+            "规划约束_Pr是否达标": bool(comp["规划约束_Pr是否达标"]),
+            "Q10低排放潜力余量_mg_m3": float(comp["Q10低排放潜力余量_mg_m3"]),
+            "是否满足Q10低排放潜力指标": bool(comp["是否满足Q10低排放潜力指标"]),
+            "稳健达标余量_mg_m3": float(comp["稳健达标余量_mg_m3"]),
+            "是否满足稳健达标余量": bool(comp["是否满足稳健达标余量"]),
+            "Q10约束是否满足": bool(comp["Q10约束是否满足"]),
+            "Q50是否低于2800": bool(comp["Q50是否低于2800"]),
+            "Q50较基准是否不升高": bool(comp["Q50较基准是否不升高"]),
+            "Q90较基准是否不升高": bool(comp["Q90较基准是否不升高"]),
+            "Q90是否高风险": bool(comp["Q90是否高风险"]),
+            "低排放工况层概率Pr_low": float(comp["低排放工况层概率Pr_low"]),
+            "Q50尾部融合alpha": float(comp["Q50尾部融合alpha"]),
+            "所属工况层名称": comp["所属工况层名称"],
+            "Pr_strict柔性约束是否满足": bool(comp["Pr_strict柔性约束是否满足"]),
+            "Pr_strict中位约束是否满足": bool(comp["Pr_strict中位约束是否满足"]),
+            "Pr_near柔性约束是否满足": bool(comp["Pr_near柔性约束是否满足"]),
             "温度宽约束违规": float(comp["温度宽约束违规"]),
             "负压平滑惩罚": float(comp["负压平滑惩罚"]),
             "当前工况标准化调节量": float(comp["当前工况标准化调节量"]),
             "历史达标IQR距离": float(comp["历史达标IQR距离"]),
+            "整体工况达标模板距离": float(comp["整体工况达标模板距离"]),
+            "总调节量": float(comp["总调节量"]),
+            "方案B最小总调节量": float(comp["方案B最小总调节量"]),
+            "是否满足方案B最小调节量": bool(comp["是否满足方案B最小调节量"]),
+            "最大单箱调节量": float(comp["最大单箱调节量"]),
+            "相邻风箱最大差值": float(comp["相邻风箱最大差值"]),
+            "最大温度增量": float(comp["最大温度增量"]),
+            "温度越界数量_P05_P95": int(comp["温度越界数量_P05_P95"]),
+            "温度越界数量_P01_P99": int(comp["温度越界数量_P01_P99"]),
+            "是否满足严格工程约束": bool(comp["是否满足严格工程约束"]),
+            "工程可实施性评分": float(comp["工程可实施性评分"]),
             "目标强度": {str(i): float(item[1][i - 1]) for i in BOX_IDS},
             "目标原始负压": {str(i): -float(item[1][i - 1]) for i in BOX_IDS},
         }
 
-    scheme_a_payload = scheme_payload("方案A_理论达标优先方案", scheme_a, scheme_a_note)
-    scheme_b_payload = scheme_payload("方案B_折中低排放方案", scheme_b, "Q10达标缺口目标下综合评分最低，调节量与模板距离相对折中")
+    scheme_a_payload = scheme_payload("方案A_Q50最优方案", scheme_a, scheme_a_note)
+    scheme_b_payload = scheme_payload("方案B_Q90风险更低方案", scheme_b, scheme_b_note)
     diagnostics = {
         "main_range": "P05-P95",
-        "model_role": "Q10/Q05达标潜力评分，不单独承担现场达标判定",
-        "target_feasible": bool(final_co <= EMISSION_STANDARD),
-        "target_success": bool(final_co <= EMISSION_STANDARD),
+        "model_role": "第二问预测器外的规划层：Q50达标约束 + Q90风险约束 + Pr(CO<=2800)概率约束，Q10仅作低排放潜力指标",
+        "condition_gate": condition_gate,
+        "condition_gate_allows_q50_claim": bool(q50_claim_allowed),
+        "base_regime_id": int(base_regime_id),
+        "base_regime_name": str(base_scenario.get("regime_name", "")),
+        "base_low_layer_probability": float(base_low_layer_prob),
+        "base_near_probability": float(base_near_prob),
+        "base_strict_probability": float(base_strict_prob),
+        "base_template_distance": float(base_template_distance),
+        "target_feasible": bool(
+            q50_claim_allowed
+            and final_comp.get("Q50是否低于2800", False)
+            and final_comp.get("Q90较基准是否不升高", False)
+            and (not strict_probability_constraint_enabled or final_comp.get("Pr_strict柔性约束是否满足", False))
+        ),
+        "target_success": bool(
+            q50_claim_allowed
+            and final_comp.get("Q50是否低于2800", False)
+            and final_comp.get("Q90较基准是否不升高", False)
+            and (not strict_probability_constraint_enabled or final_comp.get("Pr_strict柔性约束是否满足", False))
+        ),
         "min_co": float(min_co),
-        "score_best_co": float(scheme_b[2]["Q10_CO_low_final"]),
-        "final_selection_rule": "先Q10达标缺口优先；若Q10未低于2800，则采用Q05理论极限方案",
+        "score_best_co": float(scheme_b[2]["Q50_CO"]),
+        "final_selection_rule": f"三层规划约束：Q50(P)<={Q50_DESIRED_STANDARD:.0f}，Q90(P)<=Q90(P0)，Pr(CO<=2800)>={PLANNING_PROBABILITY_THRESHOLD:.2f}；Q10<={Q10_CONSTRAINT_STANDARD:.0f}仅作低排放潜力指标",
         "final_co": float(final_co),
         "final_adjustment_norm": float(final_comp["当前工况标准化调节量"]),
         "final_near_probability": float(final_comp["近达标概率Pr_CO_le_3200"]),
         "final_standard_probability": float(final_comp["严格达标概率Pr_CO_le_2800"]),
-        "final_historical_distance": float(final_comp["历史达标IQR距离"]),
+        "final_low_layer_probability": float(final_comp["低排放工况层概率Pr_low"]),
+        "final_historical_distance": float(final_comp["整体工况达标模板距离"]),
         "probability_weight": float(probability_weight),
         "model_co_weight": float(model_co_weight),
         "template_weight": float(template_weight),
         "probability_term_enabled": bool(probability_weight > 0),
-        "low_emission_seed_count": int(max(0, len(starts) - 6)),
+        "strict_probability_constraint_enabled": bool(strict_probability_constraint_enabled),
+        "low_emission_seed_count": int(max(0, len(starts) - 12)),
         "scheme_a": scheme_a_payload,
         "scheme_b": scheme_b_payload,
+        "scheme_b_min_adjust": float(min_adjust),
+        "strict_engineering_candidate_count": int(len(strict_engineering_candidates)),
+        "probability_feasible_candidate_count": int(len(prob_feasible_candidates)),
+        "q50_constraint_candidate_count": int(len(q50_feasible_candidates)),
+        "q90_nonincrease_candidate_count": int(len(q90_feasible_candidates)),
         "status": (
-            "方案A理论低分位已低于2800_需实测复核"
-            if final_co <= EMISSION_STANDARD
-            else "方案A理论低分位仍未低于2800_只能作为低排放潜力方向"
+            f"{condition_gate}_Q50已低于2800且Q90不高于基准_需实测复核"
+            if q50_claim_allowed and final_comp.get("Q50是否低于2800", False) and final_comp.get("Q90较基准是否不升高", False)
+            else (f"{condition_gate}_按Q50优化但未完全达成中位目标_需继续工况调整" if q50_claim_allowed else f"{condition_gate}_仅给出降低Q50方向_不承诺达标")
         ),
     }
     return final_plan, float(final_co), min_plan, float(min_co), search_df, diagnostics
@@ -3033,7 +4026,7 @@ def make_marginal_table(
     rows = []
     base_temp = lagged_temperature_from_row(base_frame.iloc[0], control_model)
     base_frame_for_model = apply_plan_to_frame(base_frame, base_intensity, base_temp, control_model)
-    base_pred = float(control_model.ridge_predict(base_frame_for_model)[0])
+    base_pred = float(primary_q50_prediction(control_model, base_frame_for_model)[0])
     lows, highs, _, adjacent_limits, total_budget = constrained_bounds_and_limits(ranges, constraints, base_intensity)
     for i in BOX_IDS:
         low = float(lows[i - 1])
@@ -3050,8 +4043,8 @@ def make_marginal_table(
         temp_high, _, q1_high, delta_high, _, _ = incremental_temperature_for_plan(
             base_frame.iloc[0], trial_high, base_intensity, control_model, q1_linker, speed
         )
-        pred_low = float(control_model.ridge_predict(apply_plan_to_frame(base_frame, trial_low, temp_low, control_model))[0]) if low_feasible else np.nan
-        pred_high = float(control_model.ridge_predict(apply_plan_to_frame(base_frame, trial_high, temp_high, control_model))[0]) if high_feasible else np.nan
+        pred_low = float(primary_q50_prediction(control_model, apply_plan_to_frame(base_frame, trial_low, temp_low, control_model))[0]) if low_feasible else np.nan
+        pred_high = float(primary_q50_prediction(control_model, apply_plan_to_frame(base_frame, trial_high, temp_high, control_model))[0]) if high_feasible else np.nan
         delta = pred_high - pred_low if np.isfinite(pred_low) and np.isfinite(pred_high) else np.nan
         if np.isfinite(delta):
             suggested_boundary = "P90高强度" if pred_high < pred_low else "P10低强度"
@@ -3246,6 +4239,7 @@ def make_global_comparison(
     cleaned: pd.DataFrame,
     latest_q2: pd.DataFrame,
     ranges: pd.DataFrame,
+    constraints: dict[str, object],
     control_model: LinearCOModel,
     evaluate_plan: callable,
     historical_stats: pd.DataFrame,
@@ -3256,11 +4250,17 @@ def make_global_comparison(
     min_co: float,
     diagnostics: dict[str, object],
 ) -> pd.DataFrame:
-    latest_observed = float(latest_q2.iloc[0][TARGET_COL]) if TARGET_COL in latest_q2.columns else float(cleaned.loc[cleaned["序列"].idxmax(), TARGET_COL])
+    co_context = control_target_co_context(latest_q2, cleaned)
+    actual_co_t = float(co_context["actual_co_t"])
+    actual_co_t300 = float(co_context["actual_co_t300"])
     base_eval = evaluate_plan(latest_actual)
     min_eval = evaluate_plan(min_intensity)
     best_eval = evaluate_plan(best_intensity)
-    base_direct = float(base_eval.get("q10_co", base_eval["pred_co"]))
+    base_q10 = float(base_eval.get("q10_co", base_eval["pred_co"]))
+    base_q50 = float(base_eval.get("q50_co", base_q10))
+    base_q90 = float(base_eval.get("q90_co", base_q50))
+    base_direct = base_q50
+    historical_mean_co = float(pd.to_numeric(cleaned[TARGET_COL], errors="coerce").mean())
     lows, highs = main_allowed_bounds(ranges)
     lows = np.minimum(lows, latest_actual)
     highs = np.maximum(highs, latest_actual)
@@ -3273,49 +4273,135 @@ def make_global_comparison(
     def row_for_plan(name: str, role: str, eval_data: dict[str, object], intensity: np.ndarray, target_co: float, note: str) -> dict[str, object]:
         q10 = float(eval_data.get("q10_co", eval_data["pred_co"]))
         q05 = min(float(eval_data.get("q05_co", q10)), q10)
+        q50 = float(eval_data.get("q50_co", q10))
+        q90 = float(eval_data.get("q90_co", q50))
         near_prob = float(eval_data.get("near_probability", np.nan))
         strict_prob = float(eval_data.get("strict_probability", eval_data.get("standard_probability", np.nan)))
-        return {
+        feasibility = engineering_feasibility_metrics(
+            intensity,
+            latest_actual,
+            ranges,
+            constraints,
+            np.asarray(eval_data.get("temperature_delta", np.zeros(len(BOX_IDS))), dtype=float),
+            np.asarray(eval_data.get("temperature", np.full(len(BOX_IDS), np.nan)), dtype=float),
+            cleaned,
+        )
+        denom = max(abs(target_co - historical_mean_co), 1e-6)
+        out = {
             "场景": name,
             "模型角色": role,
             "实际观测CO_mg_m3": np.nan,
+            "控制时刻序列_t": co_context["control_sequence"],
+            "预测目标序列_t+300s": co_context["target_sequence"],
+            "控制时刻时间_s": co_context["control_time_s"],
+            "预测目标时间_s": co_context["target_time_s"],
+            "实际CO(t)_mg_m3": actual_co_t,
+            "实际CO(t+300s)_mg_m3": np.nan,
+            "预测CO(t+300s)_Q50_mg_m3": q50,
             "非线性模型预测CO_mg_m3": target_co,
             "Q10_CO_low_final": q10,
             "Q05_CO_low_extreme": q05,
+            "Q50_CO": q50,
+            "Q90_CO": q90,
+            "ΔQ10": q10 - base_q10,
+            "ΔQ50": q50 - base_q50,
+            "ΔQ90": q90 - base_q90,
+            "稳健达标余量_mg_m3": EMISSION_STANDARD - q10,
+            "是否满足稳健达标余量": bool(q10 <= Q10_CONSTRAINT_STANDARD),
+            "Q10约束是否满足": bool(q10 <= Q10_CONSTRAINT_STANDARD),
+            "Q10低排放潜力余量_mg_m3": Q10_CONSTRAINT_STANDARD - q10,
+            "是否满足Q10低排放潜力指标": bool(q10 <= Q10_CONSTRAINT_STANDARD),
+            "规划约束_Q50是否低于2800": bool(q50 <= Q50_DESIRED_STANDARD),
+            "规划约束_Q90是否不高于基准": bool(q90 <= base_q90 + 1e-8),
+            "规划约束_概率阈值θ": float(PLANNING_PROBABILITY_THRESHOLD),
+            "规划约束_Pr是否达标": bool(np.isfinite(strict_prob) and strict_prob >= PLANNING_PROBABILITY_THRESHOLD),
+            "Q50是否低于2800": bool(q50 <= Q50_DESIRED_STANDARD),
+            "Q50较基准是否不升高": bool(q50 <= base_q50 + 1e-8),
+            "Q90较基准是否不升高": bool(q90 <= base_q90 + 1e-8),
+            "Q90是否高风险": bool(q90 > NEAR_STANDARD or q90 > base_q90 + 1e-8),
             "近达标概率Pr_CO_le_3200": near_prob,
             "严格达标概率Pr_CO_le_2800": strict_prob,
             "达标倾向概率": strict_prob,
+            "低排放工况层概率Pr_low": float(eval_data.get("low_layer_probability", np.nan)),
+            "Q50尾部融合alpha": float(eval_data.get("tail_alpha", np.nan)),
+            "所属工况层名称": str(eval_data.get("regime_name", "")),
             "相对2800": target_co - EMISSION_STANDARD,
             "模型是否低于2800_仅参考": target_co <= EMISSION_STANDARD,
             "较当前模型预测降低量": base_direct - target_co,
+            "负压可控贡献率": abs(target_co - base_direct) / denom,
             "标准化调节量": normalized_adjustment(intensity, latest_actual, lows, highs),
             "历史达标IQR距离": interval_distance(intensity, hist_low, hist_high, widths),
+            "整体工况达标模板距离": float(eval_data.get("template_distance", np.nan)),
             "说明": note,
         }
+        out.update(feasibility)
+        return out
 
     rows = [
         {
             "场景": "控制时刻基准工况",
             "模型角色": "基准",
-            "实际观测CO_mg_m3": latest_observed,
+            "实际观测CO_mg_m3": actual_co_t300,
+            "控制时刻序列_t": co_context["control_sequence"],
+            "预测目标序列_t+300s": co_context["target_sequence"],
+            "控制时刻时间_s": co_context["control_time_s"],
+            "预测目标时间_s": co_context["target_time_s"],
+            "实际CO(t)_mg_m3": actual_co_t,
+            "实际CO(t+300s)_mg_m3": actual_co_t300,
+            "预测CO(t+300s)_Q50_mg_m3": base_q50,
             "非线性模型预测CO_mg_m3": base_direct,
             "Q10_CO_low_final": float(base_eval.get("q10_co", base_direct)),
-            "Q05_CO_low_extreme": min(float(base_eval.get("q05_co", base_direct)), base_direct),
+            "Q05_CO_low_extreme": min(float(base_eval.get("q05_co", base_q10)), base_q10),
+            "Q50_CO": base_q50,
+            "Q90_CO": base_q90,
+            "ΔQ10": 0.0,
+            "ΔQ50": 0.0,
+            "ΔQ90": 0.0,
+            "稳健达标余量_mg_m3": EMISSION_STANDARD - base_q10,
+            "是否满足稳健达标余量": bool(base_q10 <= Q10_CONSTRAINT_STANDARD),
+            "Q10约束是否满足": bool(base_q10 <= Q10_CONSTRAINT_STANDARD),
+            "Q10低排放潜力余量_mg_m3": Q10_CONSTRAINT_STANDARD - base_q10,
+            "是否满足Q10低排放潜力指标": bool(base_q10 <= Q10_CONSTRAINT_STANDARD),
+            "规划约束_Q50是否低于2800": bool(base_q50 <= Q50_DESIRED_STANDARD),
+            "规划约束_Q90是否不高于基准": True,
+            "规划约束_概率阈值θ": float(PLANNING_PROBABILITY_THRESHOLD),
+            "规划约束_Pr是否达标": bool(
+                np.isfinite(float(base_eval.get("strict_probability", base_eval.get("standard_probability", np.nan))))
+                and float(base_eval.get("strict_probability", base_eval.get("standard_probability", np.nan))) >= PLANNING_PROBABILITY_THRESHOLD
+            ),
+            "Q50是否低于2800": bool(base_q50 <= Q50_DESIRED_STANDARD),
+            "Q50较基准是否不升高": True,
+            "Q90较基准是否不升高": True,
+            "Q90是否高风险": bool(base_q90 > NEAR_STANDARD),
             "近达标概率Pr_CO_le_3200": float(base_eval.get("near_probability", np.nan)),
             "严格达标概率Pr_CO_le_2800": float(base_eval.get("strict_probability", base_eval.get("standard_probability", np.nan))),
             "达标倾向概率": float(base_eval.get("strict_probability", base_eval.get("standard_probability", np.nan))),
+            "低排放工况层概率Pr_low": float(base_eval.get("low_layer_probability", np.nan)),
+            "Q50尾部融合alpha": float(base_eval.get("tail_alpha", np.nan)),
+            "所属工况层名称": str(base_eval.get("regime_name", "")),
             "相对2800": base_direct - EMISSION_STANDARD,
             "模型是否低于2800_仅参考": base_direct <= EMISSION_STANDARD,
             "较当前模型预测降低量": 0.0,
+            "负压可控贡献率": 0.0,
             "标准化调节量": 0.0,
             "历史达标IQR距离": interval_distance(latest_actual, hist_low, hist_high, widths),
-            "说明": "模型口径下的基准比较，不作为达标判定；Q10为主优化低分位",
+            "整体工况达标模板距离": float(base_eval.get("template_distance", np.nan)),
+            "说明": "模型口径下的基准比较，不作为达标判定；Q50/Q90/概率为规划约束，Q10为低排放潜力指标",
+            **engineering_feasibility_metrics(
+                latest_actual,
+                latest_actual,
+                ranges,
+                constraints,
+                np.asarray(base_eval.get("temperature_delta", np.zeros(len(BOX_IDS))), dtype=float),
+                np.asarray(base_eval.get("temperature", np.full(len(BOX_IDS), np.nan)), dtype=float),
+                cleaned,
+            ),
         },
     ]
     rows.append(
         row_for_plan(
-            "方案A_理论达标优先方案",
-            "理论低排放潜力",
+            "方案A_Q50最优方案",
+            "Q50最优",
             best_eval,
             best_intensity,
             best_co,
@@ -3324,8 +4410,8 @@ def make_global_comparison(
     )
     rows.append(
         row_for_plan(
-            "方案B_折中低排放方案",
-            "综合评分折中",
+            "方案B_Q90风险更低方案",
+            "Q90风险更低",
             min_eval,
             min_intensity,
             min_co,
@@ -3336,6 +4422,7 @@ def make_global_comparison(
     save_csv(comp, DATA_OUT / "主模型_非线性低排放评分对比.csv")
     save_csv(comp, DATA_OUT / "主模型_CO直接预测对比.csv")
     save_csv(comp, DATA_OUT / "方案A_B理论与折中低排放对比.csv")
+    save_csv(comp, DATA_OUT / "方案A_Q50与方案B_Q90风险对比.csv")
     return comp
 
 
@@ -3351,19 +4438,66 @@ def make_latest_comparison(
     speed: float,
 ) -> pd.DataFrame:
     base = latest_q2.copy()
-    latest_actual_co = float(cleaned.loc[cleaned["序列"].idxmax(), TARGET_COL])
+    co_context = control_target_co_context(latest_q2, cleaned)
+    actual_co_t = float(co_context["actual_co_t"])
+    actual_co_t300 = float(co_context["actual_co_t300"])
     q2_baseline_temp = lagged_temperature_from_row(base.iloc[0], control_model)
     base_control_frame = apply_plan_to_frame(base, base_intensity, q2_baseline_temp, control_model)
-    control_before = float(control_model.ridge_predict(base_control_frame)[0])
     best_control_frame = apply_plan_to_frame(base, best_intensity, scenario_temperature, control_model)
-    control_after = float(control_model.ridge_predict(best_control_frame)[0])
+    if hasattr(control_model, "predict_quantile_dict"):
+        base_quant = control_model.predict_quantile_dict(base_control_frame)
+        best_quant = control_model.predict_quantile_dict(best_control_frame)
+        base_q10 = float(base_quant["q10"][0])
+        after_q10 = float(best_quant["q10"][0])
+        base_q50 = float(base_quant["q50"][0])
+        base_q90 = float(base_quant["q90"][0])
+        after_q50 = float(best_quant["q50"][0])
+        after_q90 = float(best_quant["q90"][0])
+        base_q05 = float(base_quant["q05"][0])
+        after_q05 = float(best_quant["q05"][0])
+        control_before = base_q50
+        control_after = after_q50
+    else:
+        control_before = float(control_model.ridge_predict(base_control_frame)[0])
+        control_after = float(control_model.ridge_predict(best_control_frame)[0])
+        base_q10 = control_before
+        after_q10 = control_after
+        base_q05 = control_before
+        after_q05 = control_after
+        base_q50 = control_before
+        after_q50 = control_after
+        base_q90 = control_before
+        after_q90 = control_after
     model_delta = control_after - control_before
+    historical_mean_co = float(pd.to_numeric(cleaned[TARGET_COL], errors="coerce").mean())
+    contribution_after = abs(control_after - control_before) / max(abs(control_after - historical_mean_co), 1e-6)
     rows = [
         {
             "场景": "辅助模型_控制时刻基准工况",
             "口径": "调控模型直接预测",
-            "实际观测CO_mg_m3": latest_actual_co,
+            "实际观测CO_mg_m3": actual_co_t300,
+            "控制时刻序列_t": co_context["control_sequence"],
+            "预测目标序列_t+300s": co_context["target_sequence"],
+            "控制时刻时间_s": co_context["control_time_s"],
+            "预测目标时间_s": co_context["target_time_s"],
+            "实际CO(t)_mg_m3": actual_co_t,
+            "实际CO(t+300s)_mg_m3": actual_co_t300,
+            "预测CO(t+300s)_Q50_mg_m3": base_q50,
             "调控模型直接预测CO_mg_m3": control_before,
+            "Q10_CO_low_final": base_q10,
+            "Q05_CO_low_extreme": base_q05,
+            "Q50_CO": base_q50,
+            "Q90_CO": base_q90,
+            "ΔQ10": 0.0,
+            "ΔQ50": 0.0,
+            "ΔQ90": 0.0,
+            "稳健达标余量_mg_m3": EMISSION_STANDARD - base_q10,
+            "是否满足稳健达标余量": bool(base_q10 <= Q10_CONSTRAINT_STANDARD),
+            "Q10低排放潜力余量_mg_m3": Q10_CONSTRAINT_STANDARD - base_q10,
+            "是否满足Q10低排放潜力指标": bool(base_q10 <= Q10_CONSTRAINT_STANDARD),
+            "Q50较基准是否不升高": True,
+            "Q90是否高风险": bool(base_q90 > NEAR_STANDARD),
+            "负压可控贡献率": 0.0,
             "模型增量_mg_m3": 0.0,
             "相对2800": control_before - EMISSION_STANDARD,
             "是否达标": control_before <= EMISSION_STANDARD,
@@ -3374,7 +4508,28 @@ def make_latest_comparison(
             "场景": "辅助模型_小幅平稳优化",
             "口径": "调控模型直接预测",
             "实际观测CO_mg_m3": np.nan,
+            "控制时刻序列_t": co_context["control_sequence"],
+            "预测目标序列_t+300s": co_context["target_sequence"],
+            "控制时刻时间_s": co_context["control_time_s"],
+            "预测目标时间_s": co_context["target_time_s"],
+            "实际CO(t)_mg_m3": actual_co_t,
+            "实际CO(t+300s)_mg_m3": np.nan,
+            "预测CO(t+300s)_Q50_mg_m3": after_q50,
             "调控模型直接预测CO_mg_m3": control_after,
+            "Q10_CO_low_final": after_q10,
+            "Q05_CO_low_extreme": after_q05,
+            "Q50_CO": after_q50,
+            "Q90_CO": after_q90,
+            "ΔQ10": after_q10 - base_q10,
+            "ΔQ50": after_q50 - base_q50,
+            "ΔQ90": after_q90 - base_q90,
+            "稳健达标余量_mg_m3": EMISSION_STANDARD - after_q10,
+            "是否满足稳健达标余量": bool(after_q10 <= Q10_CONSTRAINT_STANDARD),
+            "Q10低排放潜力余量_mg_m3": Q10_CONSTRAINT_STANDARD - after_q10,
+            "是否满足Q10低排放潜力指标": bool(after_q10 <= Q10_CONSTRAINT_STANDARD),
+            "Q50较基准是否不升高": bool(after_q50 <= base_q50 + 1e-8),
+            "Q90是否高风险": bool(after_q90 > NEAR_STANDARD),
+            "负压可控贡献率": contribution_after,
             "模型增量_mg_m3": model_delta,
             "相对2800": control_after - EMISSION_STANDARD,
             "是否达标": control_after <= EMISSION_STANDARD,
@@ -3396,25 +4551,54 @@ def make_three_scheme_outputs(
     aux_comp: pd.DataFrame,
     main_diagnostics: dict[str, object],
     aux_diagnostics: dict[str, object],
+    ranges: pd.DataFrame,
+    constraints: dict[str, object],
+    cleaned: pd.DataFrame,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     rows: list[dict[str, object]] = []
-    for scenario_name, plan_type in [
-        ("方案A_理论达标优先方案", "理论达标优先"),
-        ("方案B_折中低排放方案", "折中低排放"),
-    ]:
-        row = main_comp[main_comp["场景"] == scenario_name].iloc[0]
+    main_base = main_comp[main_comp["场景"] == "控制时刻基准工况"].iloc[0]
+
+    def append_main_row(row: pd.Series, scheme_name: str, plan_type: str, target: str) -> None:
         rows.append(
             {
-                "方案": scenario_name,
+                "方案": scheme_name,
                 "方案类型": plan_type,
-                "目标": "Q10低于2800；若Q10未达标则采用Q05理论极限" if "方案A" in scenario_name else "Q10达标缺口目标下综合评分最低",
-                "CO口径": "Q10/Q05低分位CO",
+                "目标": target,
+                "CO口径": "实际CO(t)/实际CO(t+300s)/预测CO(t+300s)分开列示",
+                "控制时刻序列_t": row.get("控制时刻序列_t", np.nan),
+                "预测目标序列_t+300s": row.get("预测目标序列_t+300s", np.nan),
+                "实际CO(t)_mg_m3": float(row.get("实际CO(t)_mg_m3", np.nan)),
+                "实际CO(t+300s)_mg_m3": float(row.get("实际CO(t+300s)_mg_m3", np.nan)),
+                "预测CO(t+300s)_Q50_mg_m3": float(row.get("预测CO(t+300s)_Q50_mg_m3", row["Q50_CO"])),
                 "预测CO_mg_m3": float(row["非线性模型预测CO_mg_m3"]),
                 "Q10_CO_low_final": float(row["Q10_CO_low_final"]),
                 "Q05_CO_low_extreme": float(row["Q05_CO_low_extreme"]),
+                "Q50_CO": float(row["Q50_CO"]),
+                "Q90_CO": float(row["Q90_CO"]),
+                "ΔQ10": float(row["ΔQ10"]),
+                "ΔQ50": float(row["ΔQ50"]),
+                "ΔQ90": float(row["ΔQ90"]),
+                "Q10低排放潜力余量_mg_m3": float(row.get("Q10低排放潜力余量_mg_m3", Q10_CONSTRAINT_STANDARD - row["Q10_CO_low_final"])),
+                "是否满足Q10低排放潜力指标": bool(row.get("是否满足Q10低排放潜力指标", row["Q10_CO_low_final"] <= Q10_CONSTRAINT_STANDARD)),
+                "规划约束_Q50是否低于2800": bool(row.get("规划约束_Q50是否低于2800", row["Q50_CO"] <= Q50_DESIRED_STANDARD)),
+                "规划约束_Q90是否不高于基准": bool(row.get("规划约束_Q90是否不高于基准", row["ΔQ90"] <= 1e-8)),
+                "规划约束_概率阈值θ": float(row.get("规划约束_概率阈值θ", PLANNING_PROBABILITY_THRESHOLD)),
+                "规划约束_Pr是否达标": bool(row.get("规划约束_Pr是否达标", row["严格达标概率Pr_CO_le_2800"] >= PLANNING_PROBABILITY_THRESHOLD)),
+                "Q50较基准是否不升高": bool(row["Q50较基准是否不升高"]),
+                "Q90是否高风险": bool(row["Q90是否高风险"]),
                 "近达标概率Pr_CO_le_3200": float(row["近达标概率Pr_CO_le_3200"]),
                 "严格达标概率Pr_CO_le_2800": float(row["严格达标概率Pr_CO_le_2800"]),
+                "低排放工况层概率Pr_low": float(row.get("低排放工况层概率Pr_low", np.nan)),
                 "相对2800": float(row["相对2800"]),
+                "总调节量": float(row["总调节量"]),
+                "最大单箱调节量": float(row["最大单箱调节量"]),
+                "相邻风箱最大差值": float(row["相邻风箱最大差值"]),
+                "最大温度增量": float(row["最大温度增量"]),
+                "温度越界数量": int(row["温度越界数量_P05_P95"]),
+                "温度越界数量_P01_P99": int(row["温度越界数量_P01_P99"]),
+                "是否满足严格工程约束": bool(row["是否满足严格工程约束"]),
+                "工程可实施性评分": float(row["工程可实施性评分"]),
+                "负压可控贡献率": float(row["负压可控贡献率"]),
                 "标准化调节量": float(row["标准化调节量"]),
                 "历史达标IQR距离": float(row["历史达标IQR距离"]),
                 "温度/工程约束口径": "宽温度约束；代表低排放潜力，不直接作为工程执行承诺",
@@ -3422,37 +4606,97 @@ def make_three_scheme_outputs(
             }
         )
 
+    append_main_row(main_base, "方案0_当前基准工况", "当前基准工况", "不调节，作为所有方案的参照")
+    for scenario_name, plan_type in [
+        ("方案A_Q50最优方案", "Q50最优"),
+        ("方案B_Q90风险更低方案", "Q90风险更低"),
+    ]:
+        row = main_comp[main_comp["场景"] == scenario_name].iloc[0]
+        target = (
+            "优先最小化预测CO(t+300s)的Q50，并检查Q50≤2800、Q90≤基准Q90、Pr(CO≤2800)≥θ"
+            if "方案A" in scenario_name
+            else "优先降低预测CO(t+300s)的Q90风险上界，兼顾Q50不劣于基准"
+        )
+        append_main_row(row, scenario_name, plan_type, target)
+
     aux_after = aux_comp[aux_comp["场景"] == "辅助模型_小幅平稳优化"].iloc[0]
-    strict_temp_ok = bool((aux_decision["第一问温度增量"].abs() <= ENGINEERING_TEMP_DELTA_LIMIT + 1e-8).all())
+    aux_target = aux_decision.sort_values("风箱编号")["最优目标强度"].to_numpy(dtype=float)
+    aux_base = aux_decision.sort_values("风箱编号")["控制时刻实际强度"].to_numpy(dtype=float)
+    aux_temp_delta = aux_decision.sort_values("风箱编号")["第一问温度增量"].to_numpy(dtype=float)
+    aux_temp = aux_decision.sort_values("风箱编号")["增量叠加后温度"].to_numpy(dtype=float)
+    aux_metrics = engineering_feasibility_metrics(aux_target, aux_base, ranges, constraints, aux_temp_delta, aux_temp, cleaned)
+    strict_temp_ok = bool((np.abs(aux_temp_delta) <= ENGINEERING_TEMP_DELTA_LIMIT + 1e-8).all())
     rows.append(
         {
             "方案": "方案C_工程平稳方案",
             "方案类型": "工程平稳",
-            "目标": "小幅调节、温度可行、相邻平滑",
-            "CO口径": "Q10低分位CO/辅助平稳预测",
+            "目标": "严格工程约束下小幅调节、温度可行、相邻平滑",
+            "CO口径": "实际CO(t)/预测CO(t+300s)分开列示；方案C为辅助平稳预测",
+            "控制时刻序列_t": aux_after.get("控制时刻序列_t", np.nan),
+            "预测目标序列_t+300s": aux_after.get("预测目标序列_t+300s", np.nan),
+            "实际CO(t)_mg_m3": float(aux_after.get("实际CO(t)_mg_m3", np.nan)),
+            "实际CO(t+300s)_mg_m3": float(aux_after.get("实际CO(t+300s)_mg_m3", np.nan)),
+            "预测CO(t+300s)_Q50_mg_m3": float(aux_after.get("预测CO(t+300s)_Q50_mg_m3", aux_after["Q50_CO"])),
             "预测CO_mg_m3": float(aux_after["调控模型直接预测CO_mg_m3"]),
-            "Q10_CO_low_final": float(aux_after["调控模型直接预测CO_mg_m3"]),
-            "Q05_CO_low_extreme": np.nan,
+            "Q10_CO_low_final": float(aux_after["Q10_CO_low_final"]),
+            "Q05_CO_low_extreme": float(aux_after["Q05_CO_low_extreme"]),
+            "Q50_CO": float(aux_after["Q50_CO"]),
+            "Q90_CO": float(aux_after["Q90_CO"]),
+            "ΔQ10": float(aux_after["ΔQ10"]),
+            "ΔQ50": float(aux_after["ΔQ50"]),
+            "ΔQ90": float(aux_after["ΔQ90"]),
+            "Q10低排放潜力余量_mg_m3": float(aux_after.get("Q10低排放潜力余量_mg_m3", Q10_CONSTRAINT_STANDARD - aux_after["Q10_CO_low_final"])),
+            "是否满足Q10低排放潜力指标": bool(aux_after.get("是否满足Q10低排放潜力指标", aux_after["Q10_CO_low_final"] <= Q10_CONSTRAINT_STANDARD)),
+            "规划约束_Q50是否低于2800": bool(aux_after["Q50_CO"] <= Q50_DESIRED_STANDARD),
+            "规划约束_Q90是否不高于基准": bool(aux_after["ΔQ90"] <= 1e-8),
+            "规划约束_概率阈值θ": float(PLANNING_PROBABILITY_THRESHOLD),
+            "规划约束_Pr是否达标": np.nan,
+            "Q50较基准是否不升高": bool(aux_after["Q50较基准是否不升高"]),
+            "Q90是否高风险": bool(aux_after["Q90是否高风险"]),
             "近达标概率Pr_CO_le_3200": np.nan,
             "严格达标概率Pr_CO_le_2800": np.nan,
             "相对2800": float(aux_after["相对2800"]),
-            "标准化调节量": float(aux_decision["本方案总调节量"].iloc[0]),
+            "总调节量": float(aux_metrics["总调节量"]),
+            "最大单箱调节量": float(aux_metrics["最大单箱调节量"]),
+            "相邻风箱最大差值": float(aux_metrics["相邻风箱最大差值"]),
+            "最大温度增量": float(aux_metrics["最大温度增量"]),
+            "温度越界数量": int(aux_metrics["温度越界数量_P05_P95"]),
+            "温度越界数量_P01_P99": int(aux_metrics["温度越界数量_P01_P99"]),
+            "是否满足严格工程约束": bool(aux_metrics["是否满足严格工程约束"]),
+            "工程可实施性评分": float(aux_metrics["工程可实施性评分"]),
+            "负压可控贡献率": float(aux_after["负压可控贡献率"]),
+            "标准化调节量": float(aux_metrics["标准化调节量_相对预算"]),
             "历史达标IQR距离": np.nan,
             "温度/工程约束口径": f"严格温度增量<={ENGINEERING_TEMP_DELTA_LIMIT:g}，并执行单箱、总调节量、相邻风箱约束",
             "说明": "工程平稳推荐方案；可能仍高于2800，但更接近现场执行",
             "温度严格可行": strict_temp_ok,
-            "压力约束最大违规量": float(aux_diagnostics.get("best_constraint_violation", np.nan)),
+            "压力约束最大违规量": float(aux_metrics["压力约束最大违规量"]),
         }
     )
     summary = pd.DataFrame(rows)
     save_csv(summary, DATA_OUT / "三类调控方案汇总.csv")
     save_csv(summary, RESULT_DIR / "三类调控方案汇总.csv")
+    save_csv(summary, DATA_OUT / "调控方案综合汇总_含基准方案0.csv")
+    save_csv(summary, RESULT_DIR / "调控方案综合汇总_含基准方案0.csv")
 
     pressure_rows: list[dict[str, object]] = []
     scheme_payloads = {
-        "方案A_理论达标优先方案": main_diagnostics.get("scheme_a", {}),
-        "方案B_折中低排放方案": main_diagnostics.get("scheme_b", {}),
+        "方案A_Q50最优方案": main_diagnostics.get("scheme_a", {}),
+        "方案B_Q90风险更低方案": main_diagnostics.get("scheme_b", {}),
     }
+    for i, value in enumerate(aux_base, start=1):
+        pressure_rows.append(
+            {
+                "方案": "方案0_当前基准工况",
+                "风箱编号": i,
+                "目标强度": float(value),
+                "目标原始负压": -float(value),
+                "控制时刻实际强度": float(value),
+                "相对控制时刻实际强度变化": 0.0,
+                "调整方向": "不调节",
+                "方案定位": "当前基准工况",
+            }
+        )
     for scheme_name, payload in scheme_payloads.items():
         targets = payload.get("目标强度", {})
         raw_targets = payload.get("目标原始负压", {})
@@ -3482,7 +4726,52 @@ def make_three_scheme_outputs(
     pressure = pd.DataFrame(pressure_rows)
     save_csv(pressure, DATA_OUT / "三类调控方案风箱负压组合.csv")
     save_csv(pressure, RESULT_DIR / "三类调控方案风箱负压组合.csv")
+    save_csv(pressure, DATA_OUT / "调控方案风箱负压组合_含基准方案0.csv")
+    save_csv(pressure, RESULT_DIR / "调控方案风箱负压组合_含基准方案0.csv")
     return summary, pressure
+
+
+def make_pressure_range_recommendation_table(
+    ranges: pd.DataFrame,
+    constraints: dict[str, object],
+    current_intensity: np.ndarray,
+    recommended_intensity: np.ndarray,
+) -> pd.DataFrame:
+    lows, highs, single_delta, _, _ = constrained_bounds_and_limits(ranges, constraints, current_intensity)
+    rows: list[dict[str, object]] = []
+    range_map = ranges.set_index("风箱编号").to_dict(orient="index")
+    for i in BOX_IDS:
+        r = range_map[i]
+        current_value = -float(current_intensity[i - 1])
+        recommended_value = -float(recommended_intensity[i - 1])
+        rows.append(
+            {
+                "风箱": f"{i}#风箱",
+                "历史原始负压下限": float(r.get("优化原始负压下限_更负", -float(r["优化强度上限_P90"]))),
+                "历史原始负压上限": float(r.get("优化原始负压上限_靠近0", -float(r["优化强度下限_P10"]))),
+                "工程约束下限": -float(highs[i - 1]),
+                "工程约束上限": -float(lows[i - 1]),
+                "当前值": current_value,
+                "推荐值": recommended_value,
+                "单次最大调节量": float(single_delta[i - 1]),
+            }
+        )
+    out = pd.DataFrame(
+        rows,
+        columns=[
+            "风箱",
+            "历史原始负压下限",
+            "历史原始负压上限",
+            "工程约束下限",
+            "工程约束上限",
+            "当前值",
+            "推荐值",
+            "单次最大调节量",
+        ],
+    )
+    save_csv(out, DATA_OUT / "各风箱负压调节范围与推荐值.csv")
+    save_csv(out, RESULT_DIR / "各风箱负压调节范围与推荐值.csv")
+    return out
 
 
 def evaluate_plan_over_samples(
@@ -3497,6 +4786,9 @@ def evaluate_plan_over_samples(
     eval_source = aligned[aligned["数据集"] == "测试集"].copy()
     if eval_source.empty:
         eval_source = aligned.copy()
+    if len(eval_source) > EVAL_SAMPLE_MAX:
+        take_idx = np.unique(np.linspace(0, len(eval_source) - 1, EVAL_SAMPLE_MAX, dtype=int))
+        eval_source = eval_source.iloc[take_idx].copy()
     rows = []
     horizon_samples = max(1, CONTROL_EFFECT_HORIZON_S // SAMPLE_INTERVAL_S)
     for _, row in eval_source.iterrows():
@@ -3517,12 +4809,15 @@ def evaluate_plan_over_samples(
             save_search=False,
             use_slsqp=False,
         )
+        if best_delta > 1e-8:
+            best_p = np.asarray(p0, dtype=float).copy()
+            best_delta = 0.0
         scenario_temp, _, _, temp_delta, _, _ = incremental_temperature_for_plan(row, best_p, p0, control_model, q1_linker, speed)
         q2_temp = lagged_temperature_from_row(row, control_model)
         base_frame = apply_plan_to_frame(one, p0, q2_temp, control_model)
         plan_frame = apply_plan_to_frame(one, best_p, scenario_temp, control_model)
-        base_output = float(control_model.ridge_predict(base_frame)[0])
-        plan_output = float(control_model.ridge_predict(plan_frame)[0])
+        base_output = float(primary_q50_prediction(control_model, base_frame)[0])
+        plan_output = float(primary_q50_prediction(control_model, plan_frame)[0])
         model_delta = plan_output - base_output
         base_co = float(row[TARGET_COL])
         rows.append(
@@ -3594,6 +4889,9 @@ def generate_rolling_control_trajectory(
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     window_samples = max(1, ROLLING_CONTROL_WINDOW_S // SAMPLE_INTERVAL_S)
     source = aligned.sort_values("序列").tail(window_samples).copy()
+    if len(source) > ROLLING_MAX_STEPS:
+        take_idx = np.unique(np.linspace(0, len(source) - 1, ROLLING_MAX_STEPS, dtype=int))
+        source = source.iloc[take_idx].copy()
     rows: list[dict[str, object]] = []
     previous_target: np.ndarray | None = None
     horizon_samples = max(1, CONTROL_EFFECT_HORIZON_S // SAMPLE_INTERVAL_S)
@@ -3606,30 +4904,43 @@ def generate_rolling_control_trajectory(
         current_actual = current_intensity_from_cleaned_sequence(cleaned_by_sequence, control_sequence)
         previous_reference = previous_target.copy() if previous_target is not None else current_actual.copy()
         objective, diag = objective_factory(one, control_model, q1_linker, speed, current_actual)
+        roll_lows, roll_highs, _, roll_adjacent_limits, roll_total_budget = constrained_bounds_and_limits(ranges, constraints, current_actual)
 
         def rolling_objective(intensity: np.ndarray) -> float:
             raw_value = float(objective(intensity))
-            smooth_penalty = 0.03 * normalized_adjustment(np.asarray(intensity, dtype=float), previous_reference, *constrained_bounds_and_limits(ranges, constraints, current_actual)[:2]) / len(BOX_IDS)
+            smooth_penalty = 0.03 * normalized_adjustment(np.asarray(intensity, dtype=float), previous_reference, roll_lows, roll_highs) / len(BOX_IDS)
             return raw_value + smooth_penalty
 
         starts = [current_actual, previous_reference]
-        best_p, best_delta, _ = optimize_pressure_plan(
-            ranges,
-            starts,
-            rolling_objective,
-            constraints,
-            current_actual,
-            grid_points=3,
-            max_rounds=1,
-            save_search=False,
-            use_slsqp=False,
-        )
+        if step == 1 or step % 10 == 0:
+            best_p, best_delta, _ = optimize_pressure_plan(
+                ranges,
+                starts,
+                rolling_objective,
+                constraints,
+                current_actual,
+                grid_points=3,
+                max_rounds=1,
+                save_search=False,
+                use_slsqp=False,
+            )
+            rolling_solver_note = "快速局部网格优化"
+        else:
+            best_p = feasible_initial_point(previous_reference, current_actual, roll_lows, roll_highs, roll_adjacent_limits, roll_total_budget)
+            if not is_feasible_plan(best_p, current_actual, roll_lows, roll_highs, roll_adjacent_limits, roll_total_budget):
+                best_p = np.asarray(current_actual, dtype=float).copy()
+            best_delta = float(rolling_objective(best_p))
+            rolling_solver_note = "沿用上一目标并投影到当前硬约束"
+        if best_delta > 1e-8:
+            best_p = np.asarray(current_actual, dtype=float).copy()
+            best_delta = 0.0
+            rolling_solver_note += "；不劣于基准约束触发，保持控制时刻实际负压"
         scenario_temp, _, _, temp_delta, _, _ = incremental_temperature_for_plan(row, best_p, current_actual, control_model, q1_linker, speed)
         q2_temp = lagged_temperature_from_row(row, control_model)
         base_frame = apply_plan_to_frame(one, current_actual, q2_temp, control_model)
         plan_frame = apply_plan_to_frame(one, best_p, scenario_temp, control_model)
-        base_pred = float(control_model.ridge_predict(base_frame)[0])
-        plan_pred = float(control_model.ridge_predict(plan_frame)[0])
+        base_pred = float(primary_q50_prediction(control_model, base_frame)[0])
+        plan_pred = float(primary_q50_prediction(control_model, plan_frame)[0])
         if hasattr(control_model, "predict_standard_probability"):
             base_prob = float(control_model.predict_standard_probability(base_frame)[0])
             plan_prob = float(control_model.predict_standard_probability(plan_frame)[0])
@@ -3641,6 +4952,7 @@ def generate_rolling_control_trajectory(
             base_near_prob = float(np.clip((NEAR_STANDARD + 400 - base_pred) / 800, 0.0, 1.0))
             plan_near_prob = float(np.clip((NEAR_STANDARD + 400 - plan_pred) / 800, 0.0, 1.0))
         single_step_adjust = float(np.sum(np.abs(best_p - previous_reference)))
+        single_box_step_adjust = float(np.max(np.abs(best_p - previous_reference)))
         current_adjust = float(np.sum(np.abs(best_p - current_actual)))
         previous_target = best_p.copy()
         rows.append(
@@ -3665,9 +4977,10 @@ def generate_rolling_control_trajectory(
                 "滚动目标达标倾向概率": plan_prob,
                 "相对控制时刻实际总调节量": current_adjust,
                 "相对上一目标单步调节量": single_step_adjust,
+                "相对上一目标最大单箱单步调节量": single_box_step_adjust,
                 "平均温度增量": float(np.mean(temp_delta)),
                 "目标函数评估次数": int(diag["evaluated_candidates"]),
-                "优化口径": "滚动调控：以控制时刻实际负压为约束基准，以上一时刻目标负压作平滑参考",
+                "优化口径": f"滚动调控：以控制时刻实际负压为约束基准，以上一时刻目标负压作平滑参考；{rolling_solver_note}",
                 **{f"{i}#控制时刻实际强度": float(current_actual[i - 1]) for i in BOX_IDS},
                 **{f"{i}#滚动目标强度": float(best_p[i - 1]) for i in BOX_IDS},
             }
@@ -3681,7 +4994,7 @@ def generate_rolling_control_trajectory(
             [
                 {
                     "滚动窗口样本数": int(len(trajectory)),
-                    "滚动窗口持续时间_s": int(len(trajectory) * SAMPLE_INTERVAL_S),
+                    "滚动窗口持续时间_s": int(float(trajectory["时间_s"].max() - trajectory["时间_s"].min()) + SAMPLE_INTERVAL_S),
                     "基准预测CO均值": float(trajectory["基准模型预测CO"].mean()),
                     "滚动优化预测CO均值": float(trajectory["滚动优化后预测CO"].mean()),
                     "平均模型预测降低量": float(trajectory["模型预测降低量"].mean()),
@@ -3689,9 +5002,10 @@ def generate_rolling_control_trajectory(
                     "最终步滚动优化预测CO": float(trajectory["滚动优化后预测CO"].iloc[-1]),
                     "最终步模型预测降低量": float(trajectory["模型预测降低量"].iloc[-1]),
                     "平均达标倾向概率变化": float((trajectory["滚动目标达标倾向概率"] - trajectory["基准达标倾向概率"]).mean()),
-                    "平均单步调节量": float(trajectory["相对上一目标单步调节量"].mean()),
-                    "最大单步调节量": float(trajectory["相对上一目标单步调节量"].max()),
-                    "平均相对控制时刻实际调节量": float(trajectory["相对控制时刻实际总调节量"].mean()),
+                    "平均单步总调节量": float(trajectory["相对上一目标单步调节量"].mean()),
+                    "最大单步总调节量": float(trajectory["相对上一目标单步调节量"].max()),
+                    "最大单箱单步调节量": float(trajectory["相对上一目标最大单箱单步调节量"].max()),
+                    "平均相对控制时刻实际总调节量": float(trajectory["相对控制时刻实际总调节量"].mean()),
                 }
             ]
         )
@@ -3826,20 +5140,20 @@ def make_schema(control_model: LinearCOModel, q1_linker: Q1TemperatureLinker) ->
 
 ## 关键口径
 
-- 本问重新训练 `未来300s Q10/Q05达标潜力调控模型`，保留 `CO历史浓度__*` 作为短期状态变量，不再完全删除历史 CO。
+- 本问重新训练 `300s后单点CO Q05/Q10/Q50/Q90达标潜力调控模型`，保留 `CO历史浓度__*` 作为短期状态变量，不再完全删除历史 CO。
 - 调控模型的训练数据仍沿用第二问异常修正后建模的 `滞后配准建模数据.csv`，因此风箱负压、风箱温度、机速、大烟道变量的时滞口径与第二问一致。
-- 主模型改用未来300s低分位达标潜力评分：输入为当前 CO 状态、当前过程变量和负压调节量，输出为 `Q10_CO(P)`；若 Q10 无法低于 2800，则输出 `Q05_CO(P)` 作为理论低排放极限。
-- 低排放预测采用全局/尾部融合：`CO_low_final=0.5*Q10_global+0.5*Q10_tail`；尾部模型只使用 `CO<=3200` 及其邻域样本，并对 `CO<=2800` 加高权重。
-- 分类器为两级：`Pr_near=Pr(CO<=3200)` 用于优化引导，`Pr_strict=Pr(CO<=2800)` 用于严格达标诊断。
+- 主模型改用“300s 后单点 CO”的分位数评分：优先最小化 `Q50_point(P)`，约束 `Q10_point(P)<=2700`，同时用 `Q90_point(P)` 控制风险；未来窗口中位数只作为稳定性风险诊断。
+- Q50 预测采用门控分层融合：先估计 `Pr_low=Pr(进入低排放工况层)`，再令 `Q50_final=(1-alpha)*Q50_global+alpha*Q50_tail`，其中 `alpha=f(Pr_low)`；预测后对 `Q05/Q10/Q50/Q90` 逐样本排序，消除分位数交叉。
+- 分类器为两级：`Pr_near=Pr(300s后单点CO<=3200)` 与 `Pr_strict=Pr(300s后单点CO<=2800)`；若训练集中 `single_point_pass` 正样本数不少于 20，`Pr_strict` 进入软约束，否则仅作为诊断。
 - 温度采用增量叠加口径：先用第一问当前温度模型 `{q1_linker.source_note}` 分别预测基准负压和方案负压下的温度，取 `ΔT`，再令 `T_scenario = T_第二问当前配准温度 + ΔT`。
 - 第三问负压基准使用控制时刻实际负压强度 `P_i^0`，不是预测目标时刻负压，也不是第二问中的滞后负压强度；第二问滞后强度只用于说明配准输入来源。
-- 代码输出三类方案：方案A为理论达标优先，方案B为折中低排放，方案C为工程平稳；方案C保留单箱调节上限、总调节预算、相邻风箱差值和严格温度增量约束。
-- 历史达标样本重定义为第二问修正CO<=2800且非修正异常点、非孤立低谷；这些样本单独统计风箱负压分布，并通过样本加权、达标倾向分类器和历史达标 IQR 距离进入主模型。
+- 代码输出方案0/A/B/C：方案0为当前基准工况，方案A为Q50最优，方案B为Q90风险更低，方案C为工程平稳；各方案均把单箱调节、总调节预算、相邻风箱差值和温度增量作为硬可行性判定，历史 P05/P95 边界保留为诊断和评分项。
+- 历史达标样本重定义为原始单点 CO<=2800，低 CO 浓度不剔除；第二问修正 CO 和异常标记只保留为诊断对照。这些样本单独统计风箱负压分布，并通过样本加权、达标倾向分类器和历史达标 IQR 距离进入主模型。
 - 低排放工况先按 CO较低、连续不少于30s、温度/大烟道状态稳定识别，再提取风箱负压、机速、大烟道负压/温度和后段风箱温度区间。
-- 历史达标样本同时做连续性、机速、大烟道负压/温度、时间分布和变量组重要性诊断；若达标样本对应整体工况切换，则不能只套用达标样本的风箱负压中位数模板。
-- 本问取消使用完整监测型模型作为调控复核指标；非线性模型输出只作为调控评分，不作为现场达标承诺。
+- 历史达标样本同时做连续性、机速、大烟道负压/温度、时间分布和变量组重要性诊断；达标模板距离使用 CO 状态、风箱负压/温度、机速、大烟道负压/温度等完整工况特征，不能只套用达标样本的风箱负压中位数模板。
+- 第二问模型承担主要 CO 预测器角色；第三问是在该预测器外叠加规划搜索、温度联动、工程约束和滚动控制，不把预测值当作现场达标承诺。
 - 原始负压为负值，模型输入为 `负压强度=abs(原始负压)`；目标原始负压为 `-最优目标强度`。
-- 主模型静态评分范围为各风箱历史负压强度 P05-P95；最终调控输出采用最新窗口滚动轨迹，辅助平稳调控模型使用 P10-P90 与当前附近小幅约束。
+- 主模型静态评分范围为各风箱历史负压强度 P05-P95；规划约束采用 `Q50(P)<=2800`、`Q90(P)<=Q90(P0)`、`Pr(CO<=2800)>=θ` 三层，`Q10<=2700` 仅作为低排放潜力指标。
 
 ## 模型规模
 
@@ -3859,6 +5173,8 @@ def make_report(
     main_comp: pd.DataFrame,
     aux_decision: pd.DataFrame,
     aux_comp: pd.DataFrame,
+    scheme_summary: pd.DataFrame,
+    pressure_recommendation: pd.DataFrame,
     summary: pd.DataFrame,
     historical_stats: pd.DataFrame,
     historical_summary: pd.DataFrame,
@@ -3867,6 +5183,8 @@ def make_report(
     regime_profiles: pd.DataFrame,
     trusted_audit_summary: pd.DataFrame,
     trusted_audit: pd.DataFrame,
+    leave_one_summary: pd.DataFrame,
+    leave_one_detail: pd.DataFrame,
     rolling_summary: pd.DataFrame,
     importance_group_summary: pd.DataFrame,
     control_metrics: pd.DataFrame,
@@ -3875,8 +5193,8 @@ def make_report(
     main_diagnostics: dict[str, object],
     aux_diagnostics: dict[str, object],
 ) -> None:
-    main_final = main_comp[main_comp["场景"] == "方案A_理论达标优先方案"].iloc[0]
-    main_min = main_comp[main_comp["场景"] == "方案B_折中低排放方案"].iloc[0]
+    main_final = main_comp[main_comp["场景"] == "方案A_Q50最优方案"].iloc[0]
+    main_min = main_comp[main_comp["场景"] == "方案B_Q90风险更低方案"].iloc[0]
     main_base = main_comp[main_comp["场景"] == "控制时刻基准工况"].iloc[0]
     aux_after = aux_comp[aux_comp["场景"] == "辅助模型_小幅平稳优化"].iloc[0]
     test_summary = summary[summary["评估样本"] == "测试集"].iloc[0] if "测试集" in set(summary["评估样本"]) else summary.iloc[-1]
@@ -3923,8 +5241,10 @@ def make_report(
             "滚动优化预测CO均值": np.nan,
             "平均模型预测降低量": np.nan,
             "最终步模型预测降低量": np.nan,
-            "平均单步调节量": np.nan,
-            "最大单步调节量": np.nan,
+            "平均单步总调节量": np.nan,
+            "最大单步总调节量": np.nan,
+            "最大单箱单步调节量": np.nan,
+            "平均相对控制时刻实际总调节量": np.nan,
         }
     )
     audit_row = trusted_audit_summary.iloc[0] if not trusted_audit_summary.empty else pd.Series(
@@ -3934,6 +5254,7 @@ def make_report(
             "预测3000以上样本数": 0,
             "预测低于2800比例_%": np.nan,
             "预测3000以上比例_%": np.nan,
+            "满足Q10低排放潜力指标比例_%": np.nan,
             "平均真实CO": np.nan,
             "平均预测CO": np.nan,
             "平均达标概率": np.nan,
@@ -3946,15 +5267,39 @@ def make_report(
         "真实修正CO",
         "Q10_CO_low_final",
         "Q05_CO_low_extreme",
+        "Q50_CO",
+        "Q90_CO",
         "近达标概率Pr_CO_le_3200",
         "严格达标概率Pr_CO_le_2800",
         "预测误差_预测减真实",
         "预测是否低于2800",
+        "预测是否满足Q10低排放潜力指标",
         "Q05预测是否低于2800",
+        "分位数是否单调",
+        "概率是否嵌套",
         "预测是否3000以上",
         "所属工况层名称",
     ]
     audit_view = trusted_audit[[c for c in audit_view_cols if c in trusted_audit.columns]].head(12) if not trusted_audit.empty else trusted_audit
+    leave_one_view_cols = [
+        "留一折次",
+        "留出片段起始序列",
+        "留出片段结束序列",
+        "留出样本数",
+        "留出真实CO均值",
+        "Q10_CO均值",
+        "Q50_CO均值",
+        "Q90_CO均值",
+        "Q10低于2800比例_%",
+        "Q10低排放潜力指标满足比例_%",
+        "Q50不高于真实CO比例_%",
+        "Q90低于3200比例_%",
+        "Pr_near均值",
+        "Pr_strict均值",
+        "概率嵌套违规数",
+        "验证结论",
+    ]
+    leave_one_view = leave_one_summary[[c for c in leave_one_view_cols if c in leave_one_summary.columns]] if not leave_one_summary.empty else leave_one_summary
     run_view_cols = [
         "连续片段编号",
         "起始序列",
@@ -4009,6 +5354,10 @@ def make_report(
         return value if np.isfinite(value) else 0.0
 
     pressure_share = share_of("风箱负压")
+    co_status_share = share_of("CO状态变量")
+    adjustment_share = share_of("负压调节量特征")
+    flue_pressure_share = share_of("大烟道负压")
+    speed_share = share_of("机速")
     flue_temp_share = share_of("大烟道温度")
     thermal_share = share_of("大烟道温度") + share_of("风箱温度")
     late_time_count = int(time_view.loc[time_view["时间段编号"].isin([9, 10]), "达标样本数"].sum()) if not time_view.empty else 0
@@ -4066,6 +5415,9 @@ def make_report(
         ("未来300s低排放潜力模型", "result/第3问/CO调控模型_未来300s低排放潜力.json"),
         ("可信达标样本模型复核明细", "data/第3问/结果数据/可信达标样本_调控模型预测复核.csv"),
         ("可信达标样本模型复核摘要", "data/第3问/结果数据/可信达标样本_调控模型预测复核摘要.csv"),
+        ("分位数与分类概率单调诊断", "data/第3问/结果数据/分位数与分类概率单调诊断.csv"),
+        ("达标片段留一验证", "data/第3问/结果数据/达标片段留一验证.csv"),
+        ("达标片段留一验证明细", "data/第3问/结果数据/达标片段留一验证明细.csv"),
         ("分层调控模型", "result/第3问/CO调控模型_分层低排放.json"),
         ("最新窗口滚动调控轨迹", "data/第3问/结果数据/最新窗口滚动调控轨迹.csv"),
         ("最新窗口滚动调控汇总", "data/第3问/结果数据/最新窗口滚动调控策略汇总.csv"),
@@ -4089,27 +5441,34 @@ def make_report(
 
 ## 1. 本问任务理解
 
-第3问的目标不是继续预测当前 CO，也不是用普通均值回归直接承诺达标，而是构造“当前状态 -> 未来 300s 低分位 CO”的短期调控模型。主优化量改为 `CO_low(P)=Q10_CO(P)`；若 Q10 仍无法压到 2800，则用 `Q05_CO(P)` 作为理论低排放极限方案。考虑到达标样本集中在尾部，本版采用全局低分位模型、低排放尾部局部模型和两级达标概率诊断。
+第3问不再被表述成一个单独替代现场的“低排放潜力评分模型”。更准确地说，第二问模型承担主要 CO 预测器角色；第三问是在该预测器外面增加规划搜索、温度联动、工程约束和滚动控制，形成“预测器 + 规划器”的调控模型。`Q10/Q50/Q90` 可以保留，但三层规划约束改为 `Q50(P)<=2800`、`Q90(P)<=Q90(P0)` 和 `Pr(CO<=2800)>=θ`；`Q10<=2700` 只作为低排放潜力指标，不再作为约束。
 
-- 主模型：未来 300s `Q10/Q05` 达标潜力模型。全局模型用全部样本训练，尾部模型只用 `CO<=3200` 及其达标模板邻域样本训练，并对 `CO<=2800` 加高权重；最终 `Q10` 低排放预测采用 `0.5*Q10_global + 0.5*Q10_tail`。
-- 两级分类器：`Pr_near=Pr(CO<=3200)` 用来引导优化先进入低排放区；`Pr_strict=Pr(CO<=2800)` 只作为严格达标诊断。
-- 辅助模型：工程平稳推荐方案。保留单箱调节上限、总调节预算、相邻风箱差值和严格温度增量筛选，用来给出更接近现场可执行的小幅调节方案。
+- 主模型：300s 后单点 CO 的 `Q05/Q10/Q50/Q90` 达标潜力模型。全局模型用全部样本训练，尾部模型只用 `CO<=3200` 及其达标模板邻域样本训练，并对 `CO<=2800` 加高权重；Q50 最终值采用 `Pr_low` 门控融合，所有分位数预测后统一排序，避免 `Q05>Q10` 或 `Q10>Q50` 的交叉。
+- 两级分类器：`Pr_near=Pr(300s后单点CO<=3200)` 和 `Pr_strict=Pr(300s后单点CO<=2800)`；若训练集中 `single_point_pass` 正样本数不少于 20，`Pr_strict` 进入软约束，否则只作诊断。
+- 工况门控：先判断当前状态是否接近达标工况层；接近时用第二问预测器输出的 Q50/Q90/概率进入规划约束，远离时只输出调节方向，不承诺现场达标。
+- 方案生成：先生成工程可行候选并标记硬约束，再按 `Q50(P)<=2800`、`Q90(P)<=Q90(P0)`、`Pr(CO<=2800)>=θ` 三层约束筛选和排序；Q10 仅用于描述低排放潜力。
 
 本问不再用 `当前 CO + ΔCO` 作为最终判断。模型输出只作为优化评分的一部分，方案是否真实达标需结合现场复核：
 
 ```text
-gap(P) = max(0, (CO_low(P)-2800)/500)
-Score(P)=1000*gap(P)^2 + CO_low(P)/500
-       + w_temp*temperature_violation(P)
-       + w_smooth*smooth(P)
-       + w_adjust*adjustment(P)
-       + w_template*distance_to_target_IQR(P)
-Classifier(P) = [Pr(CO<=3200), Pr(CO<=2800)]
+Hard constraints:
+  P_i in engineering range around current P_i^0
+  |P_i-P_i^0| <= Delta_i, sum_i |P_i-P_i^0| <= B
+  |P_i-P_(i-1)| <= d_i, |Delta T_i| <= {ENGINEERING_TEMP_DELTA_LIMIT:g}
+  T_scenario in historical temperature P05-P95
+
+Objective among feasible candidates:
+  layer 1: Q50_point(P) <= 2800
+  layer 2: Q90_point(P) <= Q90_point(P0)
+  layer 3: Pr(CO(t+300s)<=2800) >= theta
+  indicator only: Q10_point(P) <= 2700
+  gate: if current state is far from low-emission layer, output direction only
+Classifier(P) = [Pr_low, Pr_near, Pr_strict], with Pr_near >= Pr_strict
 ```
 
 ## 2. 可信达标样本
 
-原始历史样本共有 `{int(hist_row["全样本数"])}` 条，其中第二问修正后 CO 不高于 2800 的样本 `{int(hist_row.get("修正后CO小于等于2800样本数", hist_row["历史达标样本数"]))}` 条；剔除第二问已修正异常点、局部尖峰/跌落点和孤立低谷后，可信达标样本为 `{int(hist_row["历史达标样本数"])}` 条，占 `{hist_row["历史达标比例_%"]:.2f}%`。这些样本不再只是参考：训练时可信达标样本权重提高，另训练达标倾向分类器；优化时还加入“偏离历史达标工况 P25-P75 区间”的惩罚。各风箱可信达标工况负压分布如下：
+原始历史样本共有 `{int(hist_row["全样本数"])}` 条；历史单点可信达标样本按原始 CO≤2800 统计为 `{int(hist_row["历史达标样本数"])}` 条，占 `{hist_row["历史达标比例_%"]:.2f}%`，其中极低 CO 浓度不再剔除。作为诊断对照，第二问修正后 CO≤2800 的样本为 `{int(hist_row.get("修正后CO小于等于2800样本数", np.nan))}` 条，原“修正后 CO≤2800 且剔除修正异常、局部尖峰/跌落和孤立低谷”的严格口径为 `{int(hist_row.get("严格可信达标样本数_原异常剔除口径", np.nan))}` 条。本文以历史单点可信达标样本形成达标工况模板；未来 300s 窗口中位数达标另作稳定性诊断，不与历史单点口径混用。各风箱可信达标工况负压分布如下：
 
 {markdown_table(hist_view, float_digits=3)}
 
@@ -4147,33 +5506,43 @@ Classifier(P) = [Pr(CO<=3200), Pr(CO<=2800)]
 
 {markdown_table(time_view, float_digits=3)}
 
-从模型关联看，非线性调控模型的正向置换重要性中，风箱负压组占 `{pressure_share:.2f}%`，热状态组（大烟道温度 + 风箱温度）合计约 `{thermal_share:.2f}%`，其中大烟道温度组单独占 `{flue_temp_share:.2f}%`。这只能说明相关性，不能当作因果证明；但足以说明现有数据不支持“CO 降低主要由风箱负压单变量造成”的解释，至少需要把大烟道温度、主抽风状态和机速作为联合工况条件。也因此，主模型即使靠近历史达标负压 IQR，仍只得到 `{main_final["非线性模型预测CO_mg_m3"]:.3f}` mg/m^3、达标倾向概率 `{main_final["达标倾向概率"]:.3f}`，不能承诺达标。
+从模型关联看，变量重要性已拆成 CO 状态变量、风箱负压、风箱温度、大烟道负压、大烟道温度、机速和负压调节量特征。正向置换重要性中，CO 状态变量占 `{co_status_share:.2f}%`，风箱负压组占 `{pressure_share:.2f}%`，负压调节量特征占 `{adjustment_share:.2f}%`，大烟道负压占 `{flue_pressure_share:.2f}%`，热状态组（大烟道温度 + 风箱温度）合计约 `{thermal_share:.2f}%`，机速占 `{speed_share:.2f}%`。这只能说明相关性，不能当作因果证明；但足以说明现有数据不支持“CO 降低主要由风箱负压单变量造成”的解释，至少需要把历史 CO 状态、大烟道温度、主抽风状态和机速作为联合工况条件。因此达标模板距离改为完整工况距离，而不是只看风箱负压。当前主模型门控状态为 `{main_diagnostics.get("condition_gate", "")}`，方案 A 的 Q50 为 `{main_final["Q50_CO"]:.3f}` mg/m^3、严格达标概率 `{main_final["达标倾向概率"]:.3f}`，不能脱离门控条件承诺达标。
 
 {markdown_table(importance_view, float_digits=3)}
 
 ## 5. 分层调控响应模型
 
-调控模型重新构造未来预测数据集：每一行用控制时刻 `t` 的 CO 状态、过程变量和负压调节量，预测 `t+300s` 的 CO。历史 CO 不再删除，而是作为短期状态变量进入模型；训练目标从普通均值 CO 改为低分位 CO。全局模型使用全部样本训练 `Q10/Q05`，保证整体稳定；尾部模型只使用 `CO<=3200` 及其达标模板邻域样本训练，并对 `CO<=2800` 加高权重。最终低排放预测为：
+调控模型重新构造未来预测数据集：每一行用控制时刻 `t` 的 CO 状态、过程变量和负压调节量，预测 `t+300s` 时刻的单点 CO；同时另算 `t+300s` 后 `{FUTURE_TARGET_WINDOW_S}` s 窗口 CO 中位数作为稳定性风险诊断。历史 CO 不再删除，而是作为短期状态变量进入模型；训练目标从普通均值 CO 改为分位数 CO。全局模型使用全部样本训练 `Q05/Q10/Q50/Q90`，保证整体稳定；尾部模型只使用 `CO<=3200` 及其达标模板邻域样本训练，并对 `CO<=2800` 加高权重。Q50 采用 `Pr_low` 门控融合：
 
 ```text
 X(t) = CO状态(t) + 过程变量(t) + 负压调节量(t)
-CO_low_final = 0.5 * Q10_global + 0.5 * Q10_tail
+Pr_low = Pr(进入低排放工况层 | X(t))
+alpha = f(Pr_low)
+Q50_final = (1-alpha) * Q50_global + alpha * Q50_tail
 CO_low_extreme = 0.5 * Q05_global + 0.5 * Q05_tail
-Pr_near = Pr(CO(t+300)<=3200 | X(t))
-Pr_strict = Pr(CO(t+300)<=2800 | X(t))
+sort_each_row(Q05, Q10, Q50, Q90)
+Pr_near = Pr(CO(t+300s)<=3200 | X(t))
+Pr_strict = Pr(CO(t+300s)<=2800 | X(t))
+Pr_near = max(Pr_near_raw, Pr_strict_raw)
 ```
 
-本次主模型为 `{model_type}`，特征数为 `{len(control_model.feature_names)}`。测试集 Q10 口径 RMSE 为 `{test_metric["RMSE"]:.3f}` mg/m^3，R2 为 `{test_metric["R2"]:.3f}`；严格达标样本在测试集中占 `{test_metric.get("真实严格达标比例_%", test_metric.get("真实可信达标比例_%", np.nan)):.2f}%`。这说明模型仍不足以直接替代现场实测判定，因此本文只把它作为低排放潜力评分模型。{model_weight_note}
+本次预测器为 `{model_type}`，特征数为 `{len(control_model.feature_names)}`。测试集 Q50 口径 RMSE 为 `{test_metric["RMSE"]:.3f}` mg/m^3，R2 为 `{test_metric["R2"]:.3f}`；严格达标样本在测试集中占 `{test_metric.get("真实严格达标比例_%", test_metric.get("真实可信达标比例_%", np.nan)):.2f}%`。因此第三问不把模型输出当成现场实测判定，而是把第二问预测器输出放进规划器，由约束筛选、温度联动和工程可行性共同决定推荐方案。{model_weight_note}
+
+标签口径分开统计：历史部分使用原始单点 CO≤2800，低 CO 浓度不剔除；未来建模部分同时保留 `single_point_pass` 与 `window_median_pass`。本次未来建模全样本 `single_point_pass` 为 `{getattr(control_model, "extra", {}).get("全样本single_point_pass正样本数", np.nan)}` 条，训练集为 `{getattr(control_model, "extra", {}).get("训练集single_point_pass正样本数", np.nan)}` 条；`window_median_pass` 全样本为 `{getattr(control_model, "extra", {}).get("全样本window_median_pass正样本数", np.nan)}` 条，训练集为 `{getattr(control_model, "extra", {}).get("训练集window_median_pass正样本数", np.nan)}` 条。因此本文以 300s 后单点 CO 作为主优化目标，以窗口稳定性作为风险诊断。
 
 工况分层画像如下：
 
 {markdown_table(regime_view, float_digits=3)}
 
-为了检查“模型是否把真实达标区域抹平”，本文单独复核可信达标样本：真实 CO、`Q10/Q05` 低分位 CO 和两级分类概率逐条输出。结果显示，可信达标样本中 Q10 低于 2800 的比例为 `{audit_row["预测低于2800比例_%"]:.2f}%`，Q10 预测为 3000 以上的比例为 `{audit_row["预测3000以上比例_%"]:.2f}%`，平均真实 CO 为 `{audit_row["平均真实CO"]:.3f}`，平均 Q10 为 `{audit_row["平均预测CO"]:.3f}`，平均 `Pr_near` 为 `{audit_row.get("平均近达标概率", np.nan):.6f}`，平均 `Pr_strict` 为 `{audit_row["平均达标概率"]:.6f}`。诊断结论：{audit_row["诊断结论"]}
+为了检查“模型是否把真实达标区域抹平”，本文单独复核可信达标样本：真实 CO、`Q10/Q50/Q90` 和两级分类概率逐条输出。结果显示，可信达标样本中 Q10 低于 2800 的比例为 `{audit_row["预测低于2800比例_%"]:.2f}%`，满足 Q10 低排放潜力指标的比例为 `{audit_row.get("满足Q10低排放潜力指标比例_%", np.nan):.2f}%`，Q10 预测为 3000 以上的比例为 `{audit_row["预测3000以上比例_%"]:.2f}%`，平均真实 CO 为 `{audit_row["平均真实CO"]:.3f}`，平均 Q10 为 `{audit_row["平均预测CO"]:.3f}`，平均 Q50 为 `{audit_row.get("平均Q50_CO", np.nan):.3f}`，平均 Q90 为 `{audit_row.get("平均Q90_CO", np.nan):.3f}`，平均 `Pr_near` 为 `{audit_row.get("平均近达标概率", np.nan):.6f}`，平均 `Pr_strict` 为 `{audit_row["平均达标概率"]:.6f}`。诊断结论：{audit_row["诊断结论"]}
 
 可信达标样本模型复核表前 12 条如下：
 
 {markdown_table(audit_view, float_digits=3)}
+
+达标片段留一验证如下。每次留出一个可信达标连续片段不用来训练，用其余样本重训分位数模型与两级分类器，再检查留出片段的 `Q10/Q50/Q90` 与 `Pr_near/Pr_strict`。
+
+{markdown_table(leave_one_view, float_digits=3)}
 
 温度联动采用第一问当前温度模型 `{q1_linker.source_note}` 的增量口径：
 
@@ -4186,37 +5555,47 @@ T_scenario = T_q2_current + ΔT
 
 主模型的决策变量为 18 个风箱负压强度 `P=(P1,...,P18)`。静态评分部分使用 P05-P95 范围寻找低排放倾向组合，但最终执行建议改为滚动调控：在最新 `{int(rolling_row["滚动窗口持续时间_s"])}` s 窗口内逐点求解，后一时刻以上一时刻目标负压作为调节参考，避免一次性跳到静态组合。滚动窗口取 `{ROLLING_CONTROL_WINDOW_S}` s，是为了匹配第二问风箱负压/温度接近 300 s 的主导时滞，而不是用 30 s 短窗即时评估。
 
-第二问配准方向是“过去风箱负压/温度 -> 当前 CO”。第三问调控方向必须解释为“当前调风箱负压 -> 约 `{CONTROL_EFFECT_HORIZON_S}` s 后 CO”。因此滚动回测中，每个目标 CO 时刻都回推约 `{CONTROL_EFFECT_HORIZON_S}` s 作为控制时刻，把该控制时刻的负压作为基准，再把调控方案写入未来 CO 模型所需的滞后风箱特征。
+第二问配准方向是“过去风箱负压/温度 -> 当前 CO”。第三问调控方向必须解释为“当前调风箱负压 -> 约 `{CONTROL_EFFECT_HORIZON_S}` s 后的 CO”。因此滚动回测中，每个目标 CO 时刻都回推约 `{CONTROL_EFFECT_HORIZON_S}` s 作为控制时刻，把该控制时刻的负压作为基准，再把调控方案写入未来 CO 模型所需的滞后风箱特征。主目标回到单点 `CO(t+300s)`；未来 `{FUTURE_TARGET_WINDOW_S}` s 窗口中位数只用于稳定性诊断。
 
-本版不再让严格达标概率全程为 0 后直接退出，而是拆成两级分类器：`Pr_near` 先引导方案进入 `CO<=3200` 的低排放区，`Pr_strict` 只用于诊断是否达到 `CO<=2800`。主目标函数按“达标缺口优先”排序，CO 缺口的平方惩罚远大于温度、平滑、调节量和模板距离项：
+本版先检查训练集中 `single_point_pass` 正样本数：若不少于 20，`Pr_strict` 进入规划约束；若不足，则概率项只作为诊断输出。规划层不再把 Q10 当作硬约束，而是用三层约束筛选候选：中位预测达标、风险上界不劣于基准、严格达标概率达到阈值。
 
 ```text
-gap(P)=max(0, (CO_low(P)-2800)/500)
-Score(P)=1000*gap(P)^2
-          + CO_low(P)/500
-          + w_temp*temperature_violation(P)
-          + w_smooth*smooth(P)
-          + w_adjust*adjustment(P,P0)
-          + w_template*distance(P, 可信达标模板IQR)
+first: keep candidates satisfying engineering hard constraints
+gate: {main_diagnostics.get("condition_gate", "")}
+layer 1: Q50_CO(P) <= {Q50_DESIRED_STANDARD:.0f}
+layer 2: Q90_CO(P) <= Q90_CO(P0)
+layer 3: Pr(CO(t+300s)<=2800) >= {PLANNING_PROBABILITY_THRESHOLD:.2f}
+indicator: Q10_CO(P) <= {Q10_CONSTRAINT_STANDARD:.0f}
+scheme A: minimize Q50_CO(P)
+scheme B: minimize Q90_CO(P) under the same planning screen
 ```
 
-本次主模型状态为 `{main_diagnostics["status"]}`。控制时刻基准工况下 Q10 预测未来 CO 为 `{main_base["Q10_CO_low_final"]:.3f}` mg/m^3，`Pr_near` 为 `{main_base["近达标概率Pr_CO_le_3200"]:.3f}`、`Pr_strict` 为 `{main_base["严格达标概率Pr_CO_le_2800"]:.3f}`；方案 A 的目标低分位 CO 为 `{main_final["非线性模型预测CO_mg_m3"]:.3f}` mg/m^3，Q10 为 `{main_final["Q10_CO_low_final"]:.3f}`，Q05 为 `{main_final["Q05_CO_low_extreme"]:.3f}`，历史达标 IQR 距离为 `{main_final["历史达标IQR距离"]:.3f}`。这些数值只表示模型评分下的低排放倾向，不作为现场达标承诺。
+本次规划状态为 `{main_diagnostics["status"]}`。控制时刻 `t` 的实际 CO 为 `{main_base["实际CO(t)_mg_m3"]:.3f}` mg/m^3，目标时刻 `t+300s` 的实际 CO 为 `{main_base["实际CO(t+300s)_mg_m3"]:.3f}` mg/m^3；控制时刻基准工况下 Q10/Q50/Q90 分别为 `{main_base["Q10_CO_low_final"]:.3f}`、`{main_base["Q50_CO"]:.3f}`、`{main_base["Q90_CO"]:.3f}` mg/m^3。方案 A 的 Q10/Q50/Q90 分别为 `{main_final["Q10_CO_low_final"]:.3f}`、`{main_final["Q50_CO"]:.3f}`、`{main_final["Q90_CO"]:.3f}` mg/m^3，`ΔQ50={main_final["ΔQ50"]:.3f}`、`ΔQ90={main_final["ΔQ90"]:.3f}`。这些数值是规划器对 `CO(t+300s)` 的预测口径，不与控制时刻实测 CO 混用。
 
 主模型对比如下：
 
-{markdown_table(main_comp[["场景", "模型角色", "实际观测CO_mg_m3", "非线性模型预测CO_mg_m3", "Q10_CO_low_final", "Q05_CO_low_extreme", "近达标概率Pr_CO_le_3200", "严格达标概率Pr_CO_le_2800", "相对2800", "模型是否低于2800_仅参考", "较当前模型预测降低量", "标准化调节量", "历史达标IQR距离", "说明"]], float_digits=3)}
+{markdown_table(main_comp[["场景", "模型角色", "实际CO(t)_mg_m3", "实际CO(t+300s)_mg_m3", "预测CO(t+300s)_Q50_mg_m3", "Q10_CO_low_final", "Q50_CO", "Q90_CO", "ΔQ50", "ΔQ90", "Q10低排放潜力余量_mg_m3", "规划约束_Q50是否低于2800", "规划约束_Q90是否不高于基准", "规划约束_Pr是否达标", "严格达标概率Pr_CO_le_2800", "总调节量", "最大单箱调节量", "是否满足严格工程约束", "工程可实施性评分", "负压可控贡献率", "说明"]], float_digits=3)}
 
-最终输出三类方案，而不是只给单一推荐：
+方案0与三类调控方案综合判定如下：
 
-- 方案 A：理论达标优先方案。目标是 `Q10` 预测低于 2800；若 Q10 未达标，则采用 `Q05` 作为理论低排放极限。当前方案 A 的目标低分位 CO 为 `{main_final["非线性模型预测CO_mg_m3"]:.3f}` mg/m^3。
-- 方案 B：折中低排放方案。目标是 Q10 达标缺口目标下综合评分最低，兼顾温度、平滑、调节量和历史达标模板距离。当前方案 B 的 Q10 为 `{main_min["Q10_CO_low_final"]:.3f}` mg/m^3。
-- 方案 C：工程平稳方案。目标是小幅调节、温度可行和相邻平滑，严格执行工程约束；它可能仍高于 2800，但更接近现场执行。当前方案 C 的预测 CO 为 `{aux_after["调控模型直接预测CO_mg_m3"]:.3f}` mg/m^3。
+{markdown_table(scheme_summary[["方案", "方案类型", "实际CO(t)_mg_m3", "实际CO(t+300s)_mg_m3", "预测CO(t+300s)_Q50_mg_m3", "Q10_CO_low_final", "Q50_CO", "Q90_CO", "ΔQ50", "ΔQ90", "Q10低排放潜力余量_mg_m3", "规划约束_Q50是否低于2800", "规划约束_Q90是否不高于基准", "规划约束_Pr是否达标", "总调节量", "最大单箱调节量", "相邻风箱最大差值", "是否满足严格工程约束", "工程可实施性评分", "负压可控贡献率", "说明"]], float_digits=3)}
+
+最终输出基准和三类方案，而不是把 A/B/C 做成几乎相同的一个方案：
+
+- 方案0：当前基准工况，不调节，只作为比较基线。
+- 方案A：Q50最优方案，优先压低 `CO(t+300s)` 的 Q50。
+- 方案B：Q90风险更低方案，优先降低 `CO(t+300s)` 的 Q90 风险上界。
+- 方案C：最小调节量工程平稳方案，目标是现场执行更平滑。
 
 主模型推荐负压组合如下：
 
 {markdown_table(main_view, float_digits=3)}
 
-最新窗口滚动调控摘要如下。滚动窗口 `{int(rolling_row["滚动窗口样本数"])}` 个样本，基准预测 CO 均值为 `{rolling_row["基准预测CO均值"]:.3f}` mg/m^3，滚动优化后均值为 `{rolling_row["滚动优化预测CO均值"]:.3f}` mg/m^3，平均模型预测降低 `{rolling_row["平均模型预测降低量"]:.3f}` mg/m^3；平均单步调节量为 `{rolling_row["平均单步调节量"]:.3f}`，最大单步调节量为 `{rolling_row["最大单步调节量"]:.3f}`。
+各风箱负压调节范围与推荐值如下。该表按原始负压口径给出，负值越小表示负压越强。
+
+{markdown_table(pressure_recommendation, float_digits=3)}
+
+最新窗口滚动调控摘要如下。滚动窗口 `{int(rolling_row["滚动窗口样本数"])}` 个样本，基准预测 CO 均值为 `{rolling_row["基准预测CO均值"]:.3f}` mg/m^3，滚动优化后均值为 `{rolling_row["滚动优化预测CO均值"]:.3f}` mg/m^3，平均模型预测降低 `{rolling_row["平均模型预测降低量"]:.3f}` mg/m^3；平均单步总调节量为 `{rolling_row["平均单步总调节量"]:.3f}`，最大单步总调节量为 `{rolling_row["最大单步总调节量"]:.3f}`，最大单箱单步调节量为 `{rolling_row["最大单箱单步调节量"]:.3f}`。
 
 {markdown_table(rolling_summary, float_digits=3)}
 
@@ -4231,11 +5610,11 @@ sum_i |P_i - P_i^0| <= B
 |ΔT_i| <= {ENGINEERING_TEMP_DELTA_LIMIT:g}
 ```
 
-其中 `Delta_i` 按历史 P10-P90 宽度的 35% 估计，并限制在 `[0.10, 1.20]`；`d_i` 取相邻风箱历史强度差 P90；`B=0.45*sum(Delta_i)`。温度约束在方案 A/B 中只作为宽约束惩罚，不提前压死低排放搜索；在方案 C 中作为严格筛选条件。
+其中 `Delta_i` 按历史 P10-P90 宽度的 35% 估计，并限制在 `[0.10, 1.20]`；`d_i` 取相邻风箱历史强度差 P90；`B=0.45*sum(Delta_i)`。这些约束不再只放在方案 C 后筛选，而是同步写入方案 A/B/C 的可执行性判定；方案 C 采用最严格现场口径。
 
 辅助模型下，当前工况小幅平稳优化后的直接预测 CO 为 `{aux_after["调控模型直接预测CO_mg_m3"]:.3f}` mg/m^3，模型预测降低 `{aux_after["模型预测降低量"]:.3f}` mg/m^3。这说明如果只允许当前附近小幅平稳调整，降 CO 空间有限。
 
-{markdown_table(aux_comp[["场景", "口径", "实际观测CO_mg_m3", "调控模型直接预测CO_mg_m3", "模型增量_mg_m3", "相对2800", "是否达标", "模型预测降低量"]], float_digits=3)}
+{markdown_table(aux_comp[["场景", "口径", "实际CO(t)_mg_m3", "实际CO(t+300s)_mg_m3", "预测CO(t+300s)_Q50_mg_m3", "Q10_CO_low_final", "Q50_CO", "Q90_CO", "ΔQ50", "ΔQ90", "Q10低排放潜力余量_mg_m3", "模型增量_mg_m3", "相对2800", "是否达标", "模型预测降低量", "负压可控贡献率"]], float_digits=3)}
 
 辅助模型的平稳调控组合如下：
 
@@ -4259,19 +5638,19 @@ sum_i |P_i - P_i^0| <= B
 
 ## 10. 补充说明
 
-- 主模型保留当前 CO 和历史 CO 作为短期状态变量，但不再用 `当前CO + ΔCO` 判断是否达标；模型直接学习 `CO(t+300s)` 的 `Q10/Q05` 低分位达标潜力。
-- 历史达标样本改为第二问修正 CO≤2800 且非异常、非孤立低谷；可信达标样本只有 `{int(hist_row["历史达标样本数"])}` 条且连续性不足，最长连续达标 `{int(compliant_diag_row["最长连续持续时间_s"])}` s；达标样本还集中在少数时间段，不能把达标样本风箱负压中位数当成充分调控模板。
+- 主模型保留当前 CO 和历史 CO 作为短期状态变量，但不再用 `当前CO + ΔCO` 判断是否达标；模型直接学习 `CO(t+300s)` 单点的 `Q10/Q50/Q90` 分位数达标潜力，未来窗口中位数仅作为稳定性诊断。
+- 历史达标样本改为原始单点 CO≤2800，低 CO 浓度不剔除；当前历史单点达标样本为 `{int(hist_row["历史达标样本数"])}` 条。原“第二问修正CO≤2800且非异常、非孤立低谷”的严格可信口径保留为对照，不再覆盖主目标。
 - 低排放工况先按“CO较低 + 至少{LOW_EMISSION_MIN_DURATION_S}s连续 + 大烟道/后段温度状态稳定”识别，再提取 18 个风箱负压、机速、大烟道负压/温度和后段风箱温度区间；它只作为辅助参考，不作为达标优化目标。
-- 调控响应模型已改为全局低分位模型 + 低排放尾部局部模型；`CO_low_final=0.5*Q10_global+0.5*Q10_tail`。
-- 可信达标样本已逐条复核模型预测；达标概率分类器拆成 `Pr_near=Pr(CO<=3200)` 和 `Pr_strict=Pr(CO<=2800)`，其中 `Pr_near` 用于低排放区引导，`Pr_strict` 用于达标诊断。
+- 调控响应模型已改为全局分位数模型 + 低排放尾部局部模型；Q50 使用 `Pr_low` 门控融合，输出 `Q10/Q50/Q90` 三个主口径，并对 `Q05/Q10/Q50/Q90` 做预测后单调排序。
+- 可信达标样本已逐条复核模型预测；达标概率分类器拆成 `Pr_near=Pr(CO(t+300s)<=3200)` 和 `Pr_strict=Pr(CO(t+300s)<=2800)`。只有当训练集 `single_point_pass` 正样本数不少于 20 时，`Pr_strict` 才进入软约束；否则只作诊断。
 - 优化输出已由单次静态组合扩展为最新 `{ROLLING_CONTROL_WINDOW_S}` s 窗口滚动调控轨迹，并按 `{CONTROL_EFFECT_HORIZON_S}` s 控制作用时滞回推控制时刻。
-- 当前附近调节、单箱调节上限、总调节预算、相邻风箱差值和严格温度增量约束只放在方案 C 工程平稳模型中；方案 A/B 使用宽温度约束搜索低排放潜力。
+- 单箱调节上限、总调节预算、相邻风箱差值和放宽后的温度增量已进入方案硬可执行性判定；历史 P05/P95 边界保留为诊断和评分项，避免当前基准已越界时把所有候选误判为不可行。方案 B 优先从严格工程可行且总调节量不低于 `min_adjust` 的候选中选择，方案 C 为现场优先口径。
 - 第一问温度只提供增量 `ΔT`，避免第一问绝对温度与第二问配准温度时间口径不一致造成基准漂移。
 - 主模型范围为 P05-P95，状态为 `{main_diagnostics["status"]}`；主模型唯一方案评估次数为 `{main_diagnostics.get("unique_plan_evaluations", 0)}`。
 
 ## 更新记录
 
-- {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}，第3问子Agent：按用户复核意见修正，达标模板仅来自可信 CO<=2800 样本，低排放模板降为辅助参考，分层由 KMeans 改为可信达标模板邻域分层，并新增可信达标样本模型预测复核与 300s 时滞滚动调控。
+- {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}，第3问子Agent：按用户复核意见继续修正，将第三问表述为第二问预测器外的规划层；规划约束改为 Q50<=2800、Q90<=Q90(P0)、Pr(CO<=2800)>=θ，Q10<=2700 仅作为低排放潜力指标，并新增“各风箱负压调节范围与推荐值”表。
 """
     (RESULT_DIR / "第3问.md").write_text(report, encoding="utf-8")
 
@@ -4297,6 +5676,7 @@ def main() -> None:
     monitor_model = LinearCOModel.from_json(deps["第2问监测型模型"])
     control_model, control_metrics, control_importance = fit_future_tail_control_model(future_aligned)
     trusted_audit, trusted_audit_summary, trusted_audit_flags = audit_trusted_standard_predictions(future_aligned, control_model)
+    leave_one_summary, leave_one_detail = leave_one_compliant_segment_validation(future_aligned)
     q1_linker = Q1TemperatureLinker.fit_from_q1_outputs(deps)
 
     latest_clean = cleaned.loc[cleaned["序列"].idxmax()]
@@ -4321,6 +5701,9 @@ def main() -> None:
         model_co_weight,
         template_weight,
         low_seed_points,
+        constraints,
+        cleaned,
+        strict_probability_constraint_enabled=bool(getattr(control_model, "extra", {}).get("Pr_strict优化约束启用", True)),
     )
     main_diagnostics.update(main_pred_diag)
     if main_diagnostics["unhandled_q1_features"]:
@@ -4346,6 +5729,7 @@ def main() -> None:
         cleaned,
         latest_q2,
         ranges,
+        constraints,
         control_model,
         evaluate_main_plan,
         historical_stats,
@@ -4366,6 +5750,20 @@ def main() -> None:
 
     objective, aux_diagnostics = objective_factory(latest_q2, control_model, q1_linker, latest_speed, latest_actual)
     aux_best_intensity, aux_best_delta, search_record = optimize_pressure_plan(ranges, start_points, objective, constraints, latest_actual)
+    if aux_best_delta > 1e-8:
+        aux_best_intensity = latest_actual.copy()
+        aux_best_delta = 0.0
+        aux_diagnostics["non_worse_than_baseline"] = "辅助模型触发不劣于基准约束，保持控制时刻实际负压"
+    aux_adjust_total = float(np.sum(np.abs(aux_best_intensity - latest_actual)))
+    aux_target_total = min(aux_adjust_total, max(float(constraints.get("min_adjust", SCHEME_B_MIN_ADJUST)), 0.25))
+    if aux_adjust_total > aux_target_total + 1e-8:
+        scaled_intensity = latest_actual + (aux_target_total / aux_adjust_total) * (aux_best_intensity - latest_actual)
+        scaled_delta = float(objective(scaled_intensity))
+        aux_best_intensity = scaled_intensity
+        aux_best_delta = scaled_delta
+        aux_diagnostics["engineering_smooth_scaling"] = (
+            f"工程平稳方案按最小调节量口径缩放：总调节量由{aux_adjust_total:.3f}降至{aux_target_total:.3f}"
+        )
     lows, highs, _, adjacent_limits, total_budget = constrained_bounds_and_limits(ranges, constraints, latest_actual)
     slsqp_record = search_record[search_record["求解方法"] == "SLSQP连续优化"] if "求解方法" in search_record.columns else pd.DataFrame()
     aux_diagnostics["optimizer"] = "当前工况平稳调控：SLSQP连续优化 + 坐标局部精修"
@@ -4416,7 +5814,8 @@ def main() -> None:
         aux_best_delta,
         latest_speed,
     )
-    scheme_summary, scheme_pressure = make_three_scheme_outputs(global_comp, aux_decision, aux_comp, main_diagnostics, aux_diagnostics)
+    scheme_summary, scheme_pressure = make_three_scheme_outputs(global_comp, aux_decision, aux_comp, main_diagnostics, aux_diagnostics, ranges, constraints, cleaned)
+    pressure_recommendation = make_pressure_range_recommendation_table(ranges, constraints, latest_actual, global_best_intensity)
     eval_df = evaluate_plan_over_samples(future_aligned, cleaned_by_sequence, ranges, constraints, q1_linker, control_model, median_start)
     summary = summarize_eval(eval_df)
     rolling_trajectory, rolling_summary = generate_rolling_control_trajectory(
@@ -4431,16 +5830,17 @@ def main() -> None:
 
     params = {
         "生成时间": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "优化目标": "主模型按工况分层训练调控响应模型，并在最新窗口执行滚动调控；辅助模型保留当前工况附近平稳约束",
-        "调控模型构造": "重新构造未来300s预测数据集，保留历史CO状态变量，输入当前过程变量与负压调节量，输出未来300s低排放潜力",
+        "优化目标": "第二问预测器外的规划层：方案A优先最小化300s后单点Q50；规划约束为Q50<=2800、Q90<=Q90(P0)、Pr(CO<=2800)>=θ；Q10<=2700仅作低排放潜力指标",
+        "调控模型构造": "重新构造300s后单点CO数据集，保留历史CO状态变量，输入当前过程变量与负压调节量，输出单点分位数低排放潜力；窗口中位数仅作稳定性诊断",
         "温度联动": "第一问只提供ΔT=T_q1(方案)-T_q1(基准)，再叠加到第二问当前配准温度，不做绝对温度替换",
-        "情景估计": "不用当前CO+ΔCO作为最终判断；非线性模型预测CO、达标概率和历史达标距离共同构成低排放评分，不能单独替代实测达标判定",
+        "情景估计": "不用当前CO+ΔCO作为最终判断；预测器输出Q50/Q10/Q90、Pr_low/Pr_near/Pr_strict，规划器再叠加工况门控、工程约束、温度联动和滚动控制，不能单独替代实测达标判定",
         "压力口径": "原始负压为负值；模型输入使用负压强度abs(原始负压)",
         "主模型优化范围": "每个风箱历史负压强度P05-P95",
         "辅助模型优化范围": "当前工况附近小幅平稳约束叠加P10-P90",
         "低排放工况识别": low_emission["summary"].to_dict(orient="records"),
         "工况分层画像": control_model.regime_profiles.to_dict(orient="records") if hasattr(control_model, "regime_profiles") else [],
         "可信达标样本调控模型复核": trusted_audit_summary.to_dict(orient="records"),
+        "达标片段留一验证": leave_one_summary.to_dict(orient="records"),
         "滚动调控摘要": rolling_summary.to_dict(orient="records"),
         "三类调控方案汇总": scheme_summary.to_dict(orient="records"),
         "第1问重构模型": q1_linker.source_note,
@@ -4512,6 +5912,8 @@ def main() -> None:
         global_comp,
         aux_decision,
         aux_comp,
+        scheme_summary,
+        pressure_recommendation,
         summary,
         historical_stats,
         historical_summary,
@@ -4520,6 +5922,8 @@ def main() -> None:
         control_model.regime_profiles if hasattr(control_model, "regime_profiles") else pd.DataFrame(),
         trusted_audit_summary,
         trusted_audit,
+        leave_one_summary,
+        leave_one_detail,
         rolling_summary,
         importance_group_summary,
         control_metrics,
