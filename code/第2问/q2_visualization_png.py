@@ -404,9 +404,21 @@ def plot_3d_lag_search_surface() -> None:
     Z = gaussian_filter(Z, sigma=1.5)
 
     best = search.loc[search["稳健目标RMSE"].idxmin()]
-    fig = plt.figure(figsize=(8.4, 6.4), constrained_layout=True)
-    ax = fig.add_subplot(111, projection="3d")
-    surf = ax.plot_surface(X, Y, Z, cmap="viridis_r", linewidth=0, antialiased=True, alpha=0.96, rcount=90, ccount=90)
+    fig = plt.figure(figsize=(7.5, 6.4), constrained_layout=False)
+
+    # 主图：左边仍然留给手动 z 标签，但整体不再拉太宽
+    ax = fig.add_axes([0.11, 0.10, 0.68, 0.80], projection="3d")
+    
+    surf = ax.plot_surface(
+        X, Y, Z,
+        cmap="viridis_r",
+        linewidth=0,
+        antialiased=True,
+        alpha=0.96,
+        rcount=90,
+        ccount=90
+    )
+    
     ax.scatter(
         [best["1#-6#上游风箱_最大滞后_s"]],
         [best["7#-12#中游风箱_最大滞后_s"]],
@@ -416,13 +428,30 @@ def plot_3d_lag_search_surface() -> None:
         depthshade=True,
         label="最优组合",
     )
-    ax.set_title("可选 3D：时滞截断窗口寻优平滑地形")
-    ax.set_xlabel("上游最大滞后 (s)")
-    ax.set_ylabel("中游最大滞后 (s)")
-    ax.set_zlabel("稳健目标 RMSE")
+    
+    ax.set_title("可选 3D：时滞截断窗口寻优平滑地形", pad=18)
+    ax.set_xlabel("上游最大滞后 (s)", labelpad=10)
+    ax.set_ylabel("中游最大滞后 (s)", labelpad=10)
+    
+    # 重点：zlabel 的 labelpad 不要太大，太大会被挤出左边
+    ax.set_zlabel("")
+    fig.text(
+        0.045, 0.50,
+        "稳健目标 RMSE",
+        rotation=90,
+        va="center",
+        ha="center",
+        fontsize=12
+    )
+    ax.zaxis.label.set_clip_on(False)
+    
     ax.view_init(elev=28, azim=-132)
-    ax.legend(frameon=False)
-    fig.colorbar(surf, ax=ax, shrink=0.68, pad=0.08, label="稳健目标 RMSE")
+    ax.legend(frameon=False, loc="upper center", bbox_to_anchor=(0.72, 1.02))
+    
+    # 手动放 colorbar，不让 matplotlib 自动挤压 3D 轴
+    cax = fig.add_axes([0.86, 0.22, 0.025, 0.58])
+    fig.colorbar(surf, cax=cax, label="稳健目标 RMSE")
+    
     save(fig, "可选_09_3D时滞截断窗口寻优平滑曲面.png")
 
 
