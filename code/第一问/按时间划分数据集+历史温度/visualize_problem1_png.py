@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import sys
 import warnings
 from pathlib import Path
 
@@ -10,6 +11,7 @@ matplotlib.use("Agg")
 
 import matplotlib.cm as cm
 import matplotlib.pyplot as plt
+import joblib
 import numpy as np
 import pandas as pd
 import seaborn as sns
@@ -31,6 +33,9 @@ ABLATION_BY_BOX_PATH = RESULT_DIR / "problem1_history_pressure_ablation_by_box.c
 PREDICTION_PATH = RESULT_DIR / "problem1_history_pressure_ablation_predictions.xlsx"
 PRESSURE_ONLY_PATH = RESULT_DIR / "problem1_pressure_only_final.csv"
 IMPORTANCE_PATH = RESULT_DIR / "problem1_feature_importance.csv"
+FEATURES_PATH = DATA_DIR / "problem1_features_pressure_only.csv"
+FEATURE_INDEX_PATH = DATA_DIR / "problem1_feature_index.csv"
+NARX_MODEL_PATH = DATA_DIR / "最佳NARX温度反馈模型.pkl"
 
 SEQ_COL = "序列"
 SPEED_COL = "烧结机机速L1设定"
@@ -39,6 +44,11 @@ PRESSURE_COLS = [f"{i}#风箱负压" for i in BOX_IDS]
 TEMP_COLS = [f"{i}#风箱平均温度" for i in BOX_IDS]
 BEST_EXPERIMENT = "history_pressure_delta_lgbm"
 FIG_DPI = 300
+TEMP_LAGS = [1, 5, 15, 30, 60]
+TEMP_DELTA_LAGS = [1, 5, 15, 30]
+SHAP_MAX_DISPLAY = 24
+SHAP_SAMPLE_SIZE = 700
+RANDOM_STATE = 42
 
 EXPERIMENT_LABELS = {
     "time_ordered_random_forest_base": "仅负压 RF",
@@ -57,7 +67,7 @@ FIGURE_NOTES = [
     ("必备_04_模型性能对比.png", "支撑最终模型选择，并保留 pressure-only 对照。"),
     ("必备_05_预测跟踪与一致性.png", "展示最优模型实际值、预测值的一致性。"),
     ("必备_06_逐风箱误差与残差诊断.png", "定位不同风箱的预测难度和残差时间段。"),
-    ("可选_07_特征重要性结构.png", "解释模型依赖哪些负压、时序、空间派生特征。"),
+    ("可选_07_特征重要性结构.png", "用 SHAP summary 图解释历史温度、负压与空间派生特征的贡献方向和强度。"),
     ("可选_08_历史温度与负压消融贡献.png", "量化加入负压后的边际改进。"),
     ("可选_09_3D温度时空平滑曲面.png", "平滑展示目标温度的时空形态。"),
     ("可选_10_3D负压时空平滑曲面.png", "平滑展示负压输入的时空形态。"),
@@ -405,41 +415,352 @@ def categorize_feature(feature: str) -> str:
     if "temp" in lower or "target" in lower:
         return "历史温度"
     if lower.startswith("speed"):
-        return "机速"
-    if any(token in lower for token in ["lag", "delta", "rate", "roll"]):
-        return "负压时序"
+        return "机速派生"
     if any(token in lower for token in ["front", "middle", "back", "long", "short", "all"]):
-        return "分段负压"
+        return "分段/全局特征"
+    if "roll" in lower:
+        return "滚动统计"
+    if "delta" in lower or "rate" in lower:
+        return "变化率/差分"
+    if "lag" in lower:
+        return "滞后值"
     if any(token in lower for token in ["neighbor", "adjacent", "local"]):
-        return "空间邻域"
+        return "相邻空间特征"
     if lower.startswith("p_"):
-        return "原始负压"
+        return "原始/绝对负压"
     return "其他"
 
 
-def plot_feature_importance() -> Path:
+FEATURE_TYPE_ORDER = [
+    "原始/绝对负压",
+    "相邻空间特征",
+    "变化率/差分",
+    "滞后值",
+    "滚动统计",
+    "分段/全局特征",
+    "机速派生",
+    "历史温度",
+    "其他",
+]
+
+FEATURE_TYPE_COLORS = {
+    "原始/绝对负压": "#4c78a8",
+    "相邻空间特征": "#59a14f",
+    "变化率/差分": "#e15759",
+    "滞后值": "#f28e2b",
+    "滚动统计": "#76b7b2",
+    "分段/全局特征": "#b07aa1",
+    "机速派生": "#edc948",
+    "历史温度": "#9c755f",
+    "其他": "#7f7f7f",
+}
+
+SEGMENT_BOXES = {
+    "front": list(range(1, 6)),
+    "middle": list(range(6, 13)),
+    "back": list(range(13, 19)),
+    "long": list(range(1, 16)),
+    "short": list(range(16, 19)),
+    "all": BOX_IDS,
+}
+
+
+def feature_boxes(feature: str) -> list[int] | None:
+    lower = str(feature).lower()
+    direct = re.search(r"^p_(\d{2})(?:_|$)", lower)
+    if direct:
+        box_id = int(direct.group(1))
+        return [box_id] if box_id in BOX_IDS else None
+
+    if lower.startswith("p_adjacent"):
+        adjacent = re.findall(r"_(\d{2})(?:_|$)", lower)
+        adjacent_boxes = sorted({int(value) for value in adjacent if int(value) in BOX_IDS})
+        if adjacent_boxes:
+            return adjacent_boxes
+
+    segment_hits: list[int] = []
+    for segment, boxes in SEGMENT_BOXES.items():
+        if segment in lower:
+            segment_hits.extend(boxes)
+    if segment_hits:
+        return sorted(set(segment_hits))
+    return None
+
+
+def make_importance_bubble_data(importance: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    for row in importance.itertuples(index=False):
+        feature = str(row.feature)
+        boxes = feature_boxes(feature)
+        importance_percent = float(row.importance_ratio) * 100.0
+        if boxes:
+            weight = importance_percent / len(boxes)
+            for box_id in boxes:
+                rows.append({"位置": str(box_id), "特征类型": categorize_feature(feature), "重要性占比": weight})
+        else:
+            rows.append({"位置": "全局", "特征类型": categorize_feature(feature), "重要性占比": importance_percent})
+    bubble = pd.DataFrame(rows)
+    if bubble.empty:
+        return bubble
+    bubble = bubble.groupby(["位置", "特征类型"], as_index=False)["重要性占比"].sum()
+    bubble["x"] = bubble["位置"].map(lambda value: 0 if value == "全局" else int(value))
+    return bubble[bubble["重要性占比"] > 0.015].copy()
+
+
+def _plot_feature_importance_bubble() -> Path:
     importance = pd.read_csv(require_path(IMPORTANCE_PATH))
-    top = importance.head(25).copy()
+    top = importance.head(18).copy()
     top["重要性占比"] = top["importance_ratio"] * 100.0
     top["类别"] = top["feature"].map(categorize_feature)
-    grouped = importance.assign(类别=importance["feature"].map(categorize_feature))
-    grouped = grouped.groupby("类别", as_index=False)["importance_ratio"].sum()
-    grouped["重要性占比"] = grouped["importance_ratio"] * 100.0
-    grouped = grouped.sort_values("重要性占比", ascending=False)
+    bubble = make_importance_bubble_data(importance)
 
-    fig, axes = plt.subplots(1, 2, figsize=(17, 8), gridspec_kw={"width_ratios": [1.45, 1.0]}, constrained_layout=True)
-    sns.barplot(data=top.sort_values("重要性占比"), y="feature", x="重要性占比", hue="类别", dodge=False, ax=axes[0])
-    axes[0].set_title("Top 25 特征重要性")
-    axes[0].set_xlabel("重要性占比 / %")
-    axes[0].set_ylabel("")
-    axes[0].legend(title="", fontsize=8, loc="lower right")
+    fig = plt.figure(figsize=(17.2, 8.8), constrained_layout=True)
+    grid = fig.add_gridspec(1, 2, width_ratios=[1.55, 1.0])
+    ax_matrix = fig.add_subplot(grid[0, 0])
+    ax_top = fig.add_subplot(grid[0, 1])
 
-    sns.barplot(data=grouped, y="类别", x="重要性占比", color="#547a8a", ax=axes[1])
-    axes[1].set_title("特征类别重要性汇总")
-    axes[1].set_xlabel("重要性占比 / %")
-    axes[1].set_ylabel("")
-    for container in axes[1].containers:
-        axes[1].bar_label(container, fmt="%.1f%%", fontsize=9, padding=3)
+    visible_types = [name for name in FEATURE_TYPE_ORDER if name in set(bubble["特征类型"])]
+    bubble["y"] = bubble["特征类型"].map({name: i for i, name in enumerate(visible_types)})
+    max_cell = max(float(bubble["重要性占比"].max()), 0.1)
+    sizes = 90 + (bubble["重要性占比"] / max_cell) ** 0.72 * 1750
+    scatter = ax_matrix.scatter(
+        bubble["x"],
+        bubble["y"],
+        s=sizes,
+        c=bubble["重要性占比"],
+        cmap="YlGnBu",
+        edgecolors="#3b4754",
+        linewidths=0.45,
+        alpha=0.90,
+    )
+    ax_matrix.set_title("A  特征重要性在风箱位置与特征类型上的气泡分布", loc="left", fontsize=15, pad=12)
+    ax_matrix.set_xlabel("风箱编号")
+    ax_matrix.set_ylabel("特征类型")
+    ax_matrix.set_xticks([0, *BOX_IDS])
+    ax_matrix.set_xticklabels(["全局", *[str(i) for i in BOX_IDS]], rotation=0)
+    ax_matrix.set_yticks(range(len(visible_types)))
+    ax_matrix.set_yticklabels(visible_types)
+    ax_matrix.set_xlim(-0.7, 18.7)
+    ax_matrix.set_ylim(-0.7, len(visible_types) - 0.3)
+    ax_matrix.grid(True, color="#d9e1e8", linewidth=0.85, alpha=0.75)
+    ax_matrix.set_axisbelow(True)
+    colorbar = fig.colorbar(scatter, ax=ax_matrix, pad=0.012, fraction=0.045)
+    colorbar.set_label("单元累计重要性占比 / %")
+
+    legend_values = [value for value in [0.25, 0.75, 1.5, 3.0] if value <= max_cell * 1.05]
+    if not legend_values:
+        legend_values = [round(max_cell, 2)]
+    legend_handles = [
+        ax_matrix.scatter([], [], s=90 + (value / max_cell) ** 0.72 * 1750, color="#5aa6c8", alpha=0.70, edgecolors="#3b4754")
+        for value in legend_values
+    ]
+    ax_matrix.legend(
+        legend_handles,
+        [f"{value:.2g}%" for value in legend_values],
+        title="气泡面积",
+        loc="upper right",
+        frameon=True,
+        fontsize=8,
+        title_fontsize=9,
+        borderpad=0.8,
+        labelspacing=1.3,
+    )
+
+    top_plot = top.iloc[::-1].reset_index(drop=True)
+    y_pos = np.arange(len(top_plot))
+    top_sizes = 90 + (top_plot["重要性占比"] / max(float(top["重要性占比"].max()), 0.1)) ** 0.72 * 1050
+    top_colors = top_plot["类别"].map(FEATURE_TYPE_COLORS).fillna("#7f7f7f")
+    ax_top.hlines(y_pos, xmin=0, xmax=top_plot["重要性占比"], color="#d8dee6", linewidth=1.2, zorder=1)
+    ax_top.scatter(
+        top_plot["重要性占比"],
+        y_pos,
+        s=top_sizes,
+        c=top_colors,
+        edgecolors="#344054",
+        linewidths=0.5,
+        alpha=0.92,
+        zorder=2,
+    )
+    for y, value in zip(y_pos, top_plot["重要性占比"]):
+        ax_top.text(value + 0.08, y, f"{value:.2f}%", va="center", fontsize=8.5, color="#26323f")
+    ax_top.set_title("B  Top 18 单项特征气泡排序", loc="left", fontsize=15, pad=12)
+    ax_top.set_xlabel("单项重要性占比 / %")
+    ax_top.set_ylabel("")
+    ax_top.set_yticks(y_pos)
+    ax_top.set_yticklabels(top_plot["feature"], fontsize=9)
+    ax_top.set_xlim(0, float(top["重要性占比"].max()) * 1.25)
+    ax_top.grid(True, axis="x", color="#d9e1e8", linewidth=0.85, alpha=0.75)
+    ax_top.grid(False, axis="y")
+
+    legend_categories = [name for name in FEATURE_TYPE_ORDER if name in set(top["类别"])]
+    handles = [
+        ax_top.scatter([], [], s=90, color=FEATURE_TYPE_COLORS.get(name, "#7f7f7f"), edgecolors="#344054", linewidths=0.4)
+        for name in legend_categories
+    ]
+    ax_top.legend(handles, legend_categories, title="特征类型", loc="lower right", fontsize=8, title_fontsize=9, frameon=True)
+    return save_fig(fig, "可选_07_特征重要性结构.png")
+
+
+def make_time_split(n_rows: int) -> tuple[np.ndarray, np.ndarray]:
+    split = int(n_rows * 0.8)
+    return np.arange(split), np.arange(split, n_rows)
+
+
+def population_stability_index(expected: np.ndarray, actual: np.ndarray, bins: int = 10) -> float:
+    expected = np.asarray(expected, dtype=float)
+    actual = np.asarray(actual, dtype=float)
+    expected = expected[np.isfinite(expected)]
+    actual = actual[np.isfinite(actual)]
+    if len(expected) < bins or len(actual) < bins:
+        return float("nan")
+    edges = np.unique(np.quantile(expected, np.linspace(0.0, 1.0, bins + 1)))
+    if len(edges) < 3:
+        return 0.0
+    edges[0] = -np.inf
+    edges[-1] = np.inf
+    expected_counts, _ = np.histogram(expected, bins=edges)
+    actual_counts, _ = np.histogram(actual, bins=edges)
+    eps = 1e-6
+    expected_ratio = np.maximum(expected_counts / max(expected_counts.sum(), 1), eps)
+    actual_ratio = np.maximum(actual_counts / max(actual_counts.sum(), 1), eps)
+    return float(np.sum((actual_ratio - expected_ratio) * np.log(actual_ratio / expected_ratio)))
+
+
+def add_relative_pressure_drop_drift_features(x: pd.DataFrame) -> pd.DataFrame:
+    out = x.copy()
+    train_idx, test_idx = make_time_split(len(out))
+    psi = {
+        col: population_stability_index(out.iloc[train_idx][col].to_numpy(), out.iloc[test_idx][col].to_numpy())
+        for col in out.columns
+    }
+    drop_cols = [col for col, value in psi.items() if np.isfinite(value) and value >= 1.0]
+
+    p_cols = [f"p_{i:02d}" for i in BOX_IDS if f"p_{i:02d}" in out.columns]
+    p = out[p_cols]
+    p_mean = p.mean(axis=1)
+    abs_sum = (-p).sum(axis=1).replace(0, np.nan)
+    for box_id in BOX_IDS:
+        col = f"p_{box_id:02d}"
+        if col not in out.columns:
+            continue
+        out[f"{col}_minus_all_mean"] = out[col] - p_mean
+        out[f"{col}_abs_suction_share"] = (-out[col]) / abs_sum
+    return out.drop(columns=[col for col in drop_cols if col in out.columns]).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+
+def target_frame_from_aligned_clean(clean: pd.DataFrame, x_pressure: pd.DataFrame) -> pd.DataFrame:
+    if FEATURE_INDEX_PATH.exists():
+        index = pd.read_csv(FEATURE_INDEX_PATH)
+        seq_values = index[SEQ_COL].to_numpy()
+        aligned = clean.set_index(SEQ_COL).loc[seq_values].reset_index()
+    else:
+        aligned = clean.tail(len(x_pressure)).reset_index(drop=True)
+    return pd.DataFrame(
+        {f"box_{box_id:02d}_avg_temp": aligned[f"{box_id}#风箱平均温度"].astype(float) for box_id in BOX_IDS}
+    )
+
+
+def build_history_pressure_features(clean: pd.DataFrame) -> pd.DataFrame:
+    x_pressure = pd.read_csv(require_path(FEATURES_PATH))
+    y = target_frame_from_aligned_clean(clean, x_pressure)
+    features = add_relative_pressure_drop_drift_features(x_pressure)
+
+    for lag in TEMP_LAGS:
+        shifted = y.shift(lag)
+        shifted.columns = [f"{col}_lag_{lag}" for col in y.columns]
+        features = pd.concat([features, shifted], axis=1)
+    for lag in TEMP_DELTA_LAGS:
+        delta = y.shift(1) - y.shift(lag)
+        delta.columns = [f"{col}_hist_delta_1_{lag}" for col in y.columns]
+        features = pd.concat([features, delta], axis=1)
+    target_segments = {"front": range(1, 6), "middle": range(6, 13), "back": range(13, 19)}
+    for segment_name, box_ids in target_segments.items():
+        cols = [f"box_{box_id:02d}_avg_temp" for box_id in box_ids]
+        for lag in [1, 5, 15, 30]:
+            features[f"{segment_name}_temp_mean_lag_{lag}"] = y[cols].mean(axis=1).shift(lag)
+            features[f"{segment_name}_temp_range_lag_{lag}"] = (y[cols].max(axis=1) - y[cols].min(axis=1)).shift(lag)
+
+    valid = features.notna().all(axis=1)
+    return features.loc[valid].reset_index(drop=True)
+
+
+def load_narx_model():
+    if str(SCRIPT_DIR) not in sys.path:
+        sys.path.insert(0, str(SCRIPT_DIR))
+    bundle = joblib.load(require_path(NARX_MODEL_PATH))
+    return bundle["model"] if isinstance(bundle, dict) and "model" in bundle else bundle
+
+
+def sample_for_shap(x: pd.DataFrame) -> pd.DataFrame:
+    _train_idx, test_idx = make_time_split(len(x))
+    sample = x.iloc[test_idx].copy() if len(test_idx) else x.copy()
+    if len(sample) > SHAP_SAMPLE_SIZE:
+        sample = sample.sample(n=SHAP_SAMPLE_SIZE, random_state=RANDOM_STATE).sort_index()
+    return sample.reset_index(drop=True)
+
+
+def compute_multioutput_shap(model, x_sample: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, list[str]]:
+    import shap
+
+    estimators = getattr(model.model, "estimators_", None)
+    if not estimators:
+        raise ValueError("SHAP summary 需要已拟合的多输出树模型。")
+
+    shap_values = []
+    data_values = x_sample.to_numpy(dtype=float)
+    for estimator in estimators:
+        explainer = shap.TreeExplainer(estimator)
+        values = explainer.shap_values(x_sample)
+        if isinstance(values, list):
+            values = values[0]
+        shap_values.append(np.asarray(values, dtype=float))
+
+    stacked_shap = np.vstack(shap_values)
+    stacked_data = np.tile(data_values, (len(shap_values), 1))
+    mean_abs = np.abs(stacked_shap).mean(axis=0)
+    top_idx = np.argsort(mean_abs)[-SHAP_MAX_DISPLAY:]
+    top_idx = top_idx[np.argsort(mean_abs[top_idx])[::-1]]
+    top_features = [x_sample.columns[i] for i in top_idx]
+    return stacked_shap[:, top_idx], stacked_data[:, top_idx], top_features
+
+
+def plot_feature_importance() -> Path:
+    import shap
+
+    clean = pd.read_csv(require_path(CLEAN_PATH)).sort_values(SEQ_COL).reset_index(drop=True)
+    narx_model = load_narx_model()
+    x_history = build_history_pressure_features(clean)
+    required_cols = list(getattr(narx_model, "feature_columns", []))
+    missing = [col for col in required_cols if col not in x_history.columns]
+    if missing:
+        raise ValueError(f"SHAP 特征矩阵缺少模型字段: {missing[:10]}")
+
+    x_sample = sample_for_shap(x_history[required_cols])
+    shap_values, feature_values, feature_names = compute_multioutput_shap(narx_model, x_sample)
+
+    shap.summary_plot(
+        shap_values,
+        feature_values,
+        feature_names=feature_names,
+        max_display=SHAP_MAX_DISPLAY,
+        show=False,
+        plot_size=(14.5, 9.0),
+        color_bar_label="特征取值",
+    )
+    fig = plt.gcf()
+    fig.suptitle("SHAP summary：最终 ΔT-LightGBM 模型特征贡献", fontsize=15, fontweight="bold", y=1.02)
+    ax = plt.gca()
+    ax.set_xlabel("SHAP值（对温度增量预测的贡献 / ℃）")
+    ax.set_ylabel("")
+    fig.text(
+        0.01,
+        0.01,
+        f"样本：后20%测试段抽样 {len(x_sample)} 条；18个风箱输出合并展示；颜色表示对应特征原始取值。",
+        ha="left",
+        va="bottom",
+        fontsize=9,
+        color="#444444",
+    )
     return save_fig(fig, "可选_07_特征重要性结构.png")
 
 
