@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+#原始数据的可视化分析，包括时序、分布、空间剖面、相关性热图等，帮助理解数据结构与核心规律，为建模提供直观依据。
 from __future__ import annotations
 
 import re
